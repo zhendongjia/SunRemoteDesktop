@@ -1,0 +1,10 @@
+# RdpDesktopHost 示例配置
+enabled = true
+bind_address = "0.0.0.0"
+port = 3389
+fps = 30
+max_clients = 1
+allow_control = true
+
+# 留空时拒绝所有连接。支持：alice、DOMAIN\\alice、COMPUTER\\alice、.\\alice
+allowed_users = [".\\alice"]
