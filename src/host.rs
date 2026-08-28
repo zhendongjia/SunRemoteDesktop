@@ -7,25 +7,20 @@ use std::sync::{
 use anyhow::{Context, Result};
 use ironrdp_server::{ConnectionHandler, PostConnectionAction, RdpServer};
 use rcgen::generate_simple_self_signed;
+use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
 use crate::auth::LocalAccountValidator;
 use crate::config;
 use crate::display::{FrameHub, RdpDisplay};
 use crate::input::HostInputHandler;
-use crate::platform::{DesktopCapture, InputInjector};
+use crate::platform::{DesktopCapture, DesktopSize, InputInjector};
 
 #[cfg(windows)]
 pub async fn run_server(config_path: &Path) -> Result<()> {
     let settings = config::load_from(config_path)?;
-    if !settings.enabled {
-        tracing::info!("RDP desktop host is disabled");
+    if !validate_settings(&settings)? {
         return Ok(());
-    }
-    if settings.allowed_users.is_empty() {
-        anyhow::bail!(
-            "no allowed local users configured; add at least one account in the admin UI"
-        );
     }
 
     let capture = crate::platform::windows::WindowsDesktopCapture::new(settings.fps)
@@ -37,6 +32,46 @@ pub async fn run_server(config_path: &Path) -> Result<()> {
 
     let injector: Arc<dyn InputInjector> =
         Arc::new(crate::platform::windows::WindowsInputInjector::new());
+    run_server_with_backend(settings, config_path, size, hub, injector, None).await
+}
+
+#[cfg(windows)]
+pub async fn run_service_server(
+    config_path: &Path,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let settings = config::load_from(config_path)?;
+    if !validate_settings(&settings)? {
+        return Ok(());
+    }
+
+    let backend = tokio::select! {
+        result = crate::bridge::windows::wait_for_service_backend() => result?,
+        _ = wait_for_shutdown(&mut shutdown) => {
+            tracing::info!("Windows service stopped while waiting for a session agent");
+            return Ok(());
+        }
+    };
+    run_server_with_backend(
+        settings,
+        config_path,
+        backend.size,
+        backend.hub,
+        backend.injector,
+        Some(shutdown),
+    )
+    .await
+}
+
+#[cfg(windows)]
+async fn run_server_with_backend(
+    settings: config::AppConfig,
+    config_path: &Path,
+    size: DesktopSize,
+    hub: FrameHub,
+    injector: Arc<dyn InputInjector>,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> Result<()> {
     let display = RdpDisplay::new(hub, size);
     let input = HostInputHandler::new(injector, size, settings.allow_control);
     let tls_acceptor =
@@ -63,12 +98,51 @@ pub async fn run_server(config_path: &Path) -> Result<()> {
         .build();
 
     tracing::info!(%addr, width = size.width, height = size.height, "RDP mirror server listening");
-    server.run().await.context("RDP server stopped")
+    if let Some(mut shutdown) = shutdown {
+        tokio::select! {
+            result = server.run() => result.context("RDP server stopped"),
+            _ = wait_for_shutdown(&mut shutdown) => {
+                tracing::info!("RDP mirror server received the service stop request");
+                Ok(())
+            }
+        }
+    } else {
+        server.run().await.context("RDP server stopped")
+    }
 }
 
 #[cfg(not(windows))]
 pub async fn run_server(_config_path: &Path) -> Result<()> {
     anyhow::bail!("当前版本只实现 Windows 桌面采集和输入注入；跨平台接口已预留")
+}
+
+#[cfg(not(windows))]
+pub async fn run_service_server(
+    _config_path: &Path,
+    _shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    anyhow::bail!("Windows 服务和会话桥只在 Windows 构建中可用")
+}
+
+fn validate_settings(settings: &config::AppConfig) -> Result<bool> {
+    if !settings.enabled {
+        tracing::info!("RDP desktop host is disabled");
+        return Ok(false);
+    }
+    if settings.allowed_users.is_empty() {
+        anyhow::bail!(
+            "no allowed local users configured; add at least one account in the admin UI"
+        );
+    }
+    Ok(true)
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
 }
 
 fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor> {
@@ -92,7 +166,7 @@ fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor> 
     }
 
     let identity = ironrdp_server::TlsIdentityCtx::init_from_paths(cert_path, key_path)?;
-    Ok(identity.make_acceptor()?)
+    identity.make_acceptor()
 }
 
 struct ConnectionLimiter {

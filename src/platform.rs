@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DesktopSize {
     pub width: u16,
     pub height: u16,

@@ -15,7 +15,7 @@ mod windows_service_impl {
 
     use crate::{config, host};
 
-    const SERVICE_NAME: &str = "RdpDesktopHost";
+    const SERVICE_NAME: &str = "SunRemoteDesktop";
 
     pub fn run() -> Result<()> {
         service_dispatcher::start(SERVICE_NAME, ffi_service_main)
@@ -27,7 +27,7 @@ mod windows_service_impl {
 
     fn service_main(_arguments: Vec<OsString>) {
         if let Err(error) = service_main_inner() {
-            eprintln!("RdpDesktopHost service stopped: {error:#}");
+            eprintln!("SunRemoteDesktop service stopped: {error:#}");
         }
     }
 
@@ -53,18 +53,28 @@ mod windows_service_impl {
         })?;
 
         let config_path = config::config_path();
+        let (runtime_shutdown_sender, runtime_shutdown_receiver) =
+            tokio::sync::watch::channel(false);
         let (done_sender, done_receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let result = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .map_err(anyhow::Error::from)
-                .and_then(|runtime| runtime.block_on(host::run_server(&config_path)));
+                .and_then(|runtime| {
+                    runtime.block_on(host::run_service_server(
+                        &config_path,
+                        runtime_shutdown_receiver,
+                    ))
+                });
             let _ = done_sender.send(result);
         });
 
+        let mut stop_requested = false;
         loop {
             if shutdown_receiver.try_recv().is_ok() {
+                stop_requested = true;
+                let _ = runtime_shutdown_sender.send(true);
                 break;
             }
             if let Ok(result) = done_receiver.try_recv() {
@@ -83,6 +93,16 @@ mod windows_service_impl {
                 break;
             }
             std::thread::sleep(Duration::from_millis(250));
+        }
+
+        if stop_requested {
+            match done_receiver.recv_timeout(Duration::from_secs(10)) {
+                Ok(Err(error)) => return Err(error),
+                Ok(Ok(())) => {}
+                Err(error) => {
+                    tracing::warn!(?error, "timed out waiting for the RDP runtime to stop");
+                }
+            }
         }
 
         status_handle.set_service_status(ServiceStatus {

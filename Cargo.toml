@@ -1,5 +1,5 @@
 [package]
-name = "rdp-desktop-host"
+name = "sun-remote-desktop"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -15,7 +15,7 @@ eframe = "0.36"
 ironrdp-server = { version = "0.13", features = ["helper"] }
 rcgen = "0.14"
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = "0.26"
 toml = "0.9"
 tracing = "0.1"
@@ -26,6 +26,7 @@ xcap = { version = "0.9.8", features = ["image"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Security_Authentication_Identity",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",

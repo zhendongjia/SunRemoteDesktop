@@ -5234,29 +5234,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rdp-desktop-host"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "clap",
- "directories",
- "eframe",
- "ironrdp-server",
- "rcgen",
- "serde",
- "tokio",
- "tokio-rustls",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "windows",
- "windows-service",
- "xcap",
-]
-
-[[package]]
 name = "read-fonts"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6108,6 +6085,29 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "sun-remote-desktop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "clap",
+ "directories",
+ "eframe",
+ "ironrdp-server",
+ "rcgen",
+ "serde",
+ "tokio",
+ "tokio-rustls",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "windows",
+ "windows-service",
+ "xcap",
+]
 
 [[package]]
 name = "syn"

@@ -1,4 +1,4 @@
-# RdpDesktopHost 示例配置
+# SunRemoteDesktop 示例配置
 enabled = true
 bind_address = "0.0.0.0"
 port = 3389

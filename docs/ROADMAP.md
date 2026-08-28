@@ -11,10 +11,10 @@
 
 ## Phase 2 — Windows service and session bridge
 
-- [ ] Move Windows capture and input into a per-session agent.
-- [ ] Add a named-pipe protocol with versioning, frame back-pressure and ACL checks.
+- [x] Move Windows capture and input into a per-session agent.
+- [x] Add a named-pipe protocol with versioning, frame back-pressure and ACL checks.
 - [ ] Let the service track logon/logoff/session-lock events.
-- [ ] Start the agent automatically for every permitted interactive session.
+- [x] Register the session agent to start automatically at interactive logon.
 - [ ] Add service status and agent status to the administration UI.
 - [ ] Decide explicitly how secure desktop and UAC prompts are handled; do not silently weaken Windows security boundaries.
 

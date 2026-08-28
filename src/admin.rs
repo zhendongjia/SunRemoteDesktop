@@ -10,14 +10,14 @@ pub fn run() -> Result<()> {
     let app = AdminApp::load(config_path)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("RdpDesktopHost 管理")
+            .with_title("SunRemoteDesktop 管理")
             .with_inner_size([720.0, 560.0])
             .with_min_inner_size([620.0, 460.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "RdpDesktopHost 管理",
+        "SunRemoteDesktop 管理",
         options,
         Box::new(|_creation_context| Ok(Box::new(app))),
     )
@@ -83,7 +83,7 @@ impl AdminApp {
 impl eframe::App for AdminApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("RdpDesktopHost");
+            ui.heading("SunRemoteDesktop");
             ui.label("使用 RDP 传输本地桌面画面；远程操作会注入到当前本地桌面。");
             ui.add_space(8.0);
 

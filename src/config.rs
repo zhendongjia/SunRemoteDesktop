@@ -66,14 +66,14 @@ pub fn data_dir() -> PathBuf {
         std::env::var_os("PROGRAMDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-            .join("RdpDesktopHost")
+            .join("SunRemoteDesktop")
     }
 
     #[cfg(not(windows))]
     {
-        ProjectDirs::from("com", "RdpDesktopHost", "RdpDesktopHost")
+        ProjectDirs::from("com", "SunRemoteDesktop", "SunRemoteDesktop")
             .map(|dirs| dirs.data_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".rdp-desktop-host"))
+            .unwrap_or_else(|| PathBuf::from(".sun-remote-desktop"))
     }
 }
 
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn round_trip_preserves_policy() {
         let path = std::env::temp_dir().join(format!(
-            "rdp-desktop-host-config-{}.toml",
+            "sun-remote-desktop-config-{}.toml",
             std::process::id()
         ));
         let config = AppConfig {
