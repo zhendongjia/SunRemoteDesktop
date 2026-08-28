@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $serviceName = "SunRemoteDesktop"
-$ruleName = "SunRemoteDesktop (TCP 3389)"
+$ruleName = "SunRemoteDesktop (SunRDP)"
 $agentRunKey = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
 $agentRunName = "SunRemoteDesktopAgent"
 $projectRoot = Split-Path -Parent $PSScriptRoot
@@ -30,4 +30,6 @@ Get-CimInstance Win32_Process -Filter "Name = 'sun-remote-desktop.exe'" |
     }
 
 Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-Write-Host "SunRemoteDesktop 服务、会话代理自启动项和防火墙规则已移除；配置文件和证书保留不动。"
+Remove-NetFirewallRule -DisplayName "SunRemoteDesktop (RDP Transport)" -ErrorAction SilentlyContinue
+Remove-NetFirewallRule -DisplayName "SunRemoteDesktop (TCP 3389)" -ErrorAction SilentlyContinue
+Write-Host "SunRemoteDesktop service, agent autorun, and firewall rule were removed. Configuration and certificates were preserved."

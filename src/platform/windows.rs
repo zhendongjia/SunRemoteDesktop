@@ -22,20 +22,13 @@ pub struct WindowsDesktopCapture {
 
 impl WindowsDesktopCapture {
     pub fn new(fps: u32) -> Result<Self> {
-        let monitor = xcap::Monitor::all()?
-            .into_iter()
-            .find(|monitor| monitor.is_primary().unwrap_or(false))
-            .context("find the primary monitor")?;
-        let width =
-            u16::try_from(monitor.width()?).context("primary monitor is wider than RDP allows")?;
-        let height = u16::try_from(monitor.height()?)
-            .context("primary monitor is taller than RDP allows")?;
-        anyhow::ensure!(
-            width > 0 && height > 0,
-            "primary monitor has no usable size"
-        );
+        let monitor = primary_monitor()?;
+        let image = monitor
+            .capture_image()
+            .context("capture the Windows primary monitor")?;
+        let size = frame_size(image.width(), image.height())?;
         Ok(Self {
-            size: DesktopSize { width, height },
+            size,
             fps: fps.clamp(1, 120),
         })
     }
@@ -48,53 +41,90 @@ impl DesktopCapture for WindowsDesktopCapture {
 
     fn start(self: Box<Self>, publish: Box<dyn Fn(CapturedFrame) + Send>) -> Result<()> {
         let fps = self.fps;
+        let expected_size = self.size;
         thread::Builder::new()
-            .name("rdp-desktop-capture".to_string())
+            .name("sunrdp-desktop-capture".to_string())
             .spawn(move || {
-                let monitor = match xcap::Monitor::all() {
-                    Ok(monitors) => match monitors
-                        .into_iter()
-                        .find(|monitor| monitor.is_primary().unwrap_or(false))
-                    {
-                        Some(monitor) => monitor,
-                        None => {
-                            tracing::error!("unable to find the Windows primary monitor");
-                            return;
-                        }
-                    },
-                    Err(error) => {
-                        tracing::error!(?error, "unable to enumerate Windows monitors");
-                        return;
-                    }
-                };
                 let frame_period = Duration::from_millis((1000 / fps.max(1)) as u64);
                 loop {
-                    let started = std::time::Instant::now();
-                    match monitor.capture_image() {
-                        Ok(image) => {
-                            let width = image.width();
-                            let height = image.height();
-                            if let (Ok(width), Ok(height)) =
-                                (u16::try_from(width), u16::try_from(height))
-                            {
+                    let monitor = match primary_monitor() {
+                        Ok(monitor) => monitor,
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                "unable to acquire the Windows primary monitor; retrying"
+                            );
+                            thread::sleep(Duration::from_secs(1));
+                            continue;
+                        }
+                    };
+                    loop {
+                        let started = std::time::Instant::now();
+                        match monitor.capture_image() {
+                            Ok(image) => {
+                                let size = match frame_size(image.width(), image.height()) {
+                                    Ok(size) => size,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            ?error,
+                                            "captured desktop exceeds SunRDP size limits"
+                                        );
+                                        break;
+                                    }
+                                };
+                                if size != expected_size {
+                                    tracing::warn!(
+                                        expected_width = expected_size.width,
+                                        expected_height = expected_size.height,
+                                        actual_width = size.width,
+                                        actual_height = size.height,
+                                        "captured desktop size changed; reacquiring the monitor"
+                                    );
+                                    break;
+                                }
                                 publish(CapturedFrame {
-                                    width,
-                                    height,
+                                    width: size.width,
+                                    height: size.height,
                                     rgba: image.into_raw(),
                                 });
                             }
+                            Err(error) => {
+                                tracing::warn!(
+                                    ?error,
+                                    "desktop capture handle became invalid; reacquiring the monitor"
+                                );
+                                break;
+                            }
                         }
-                        Err(error) => tracing::warn!(?error, "desktop capture failed; retrying"),
+                        let elapsed = started.elapsed();
+                        if elapsed < frame_period {
+                            thread::sleep(frame_period - elapsed);
+                        }
                     }
-                    let elapsed = started.elapsed();
-                    if elapsed < frame_period {
-                        thread::sleep(frame_period - elapsed);
-                    }
+
+                    thread::sleep(Duration::from_secs(1));
                 }
             })
             .context("start desktop capture thread")?;
         Ok(())
     }
+}
+
+fn primary_monitor() -> Result<xcap::Monitor> {
+    xcap::Monitor::all()?
+        .into_iter()
+        .find(|monitor| monitor.is_primary().unwrap_or(false))
+        .context("find the primary monitor")
+}
+
+fn frame_size(width: u32, height: u32) -> Result<DesktopSize> {
+    let width = u16::try_from(width).context("captured monitor is wider than RDP allows")?;
+    let height = u16::try_from(height).context("captured monitor is taller than RDP allows")?;
+    anyhow::ensure!(
+        width > 0 && height > 0,
+        "primary monitor has no usable size"
+    );
+    Ok(DesktopSize { width, height })
 }
 
 #[derive(Default)]
@@ -243,4 +273,26 @@ pub fn validate_local_account(domain: &str, username: &str, password: &str) -> R
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_size_uses_captured_pixel_dimensions() {
+        assert_eq!(
+            frame_size(2556, 1224).unwrap(),
+            DesktopSize {
+                width: 2556,
+                height: 1224,
+            }
+        );
+    }
+
+    #[test]
+    fn frame_size_rejects_empty_capture() {
+        assert!(frame_size(0, 1080).is_err());
+        assert!(frame_size(1920, 0).is_err());
+    }
 }

@@ -2,7 +2,7 @@
 
 ## Phase 1 — Windows interactive MVP
 
-- [x] RDP/TLS listener based on IronRDP.
+- [x] SunRDP RDP/TLS listener.
 - [x] Full-frame desktop update pipeline.
 - [x] Keyboard and mouse injection through Win32.
 - [x] Local account validation and allow-list management.
@@ -34,4 +34,4 @@
 - [ ] Per-platform authentication providers while keeping the shared authorization model.
 - [ ] CI builds for Windows, Linux X11, Linux Wayland and macOS.
 
-New features should be added as capabilities behind explicit configuration switches. The RDP core should receive typed display/input/channel interfaces rather than platform-specific conditionals.
+New features should be added as capabilities behind explicit configuration switches. The SunRDP core should receive typed display/input/channel interfaces rather than platform-specific conditionals.

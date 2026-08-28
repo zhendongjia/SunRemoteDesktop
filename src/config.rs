@@ -24,7 +24,7 @@ impl Default for AppConfig {
         Self {
             enabled: true,
             bind_address: "0.0.0.0".to_string(),
-            port: 3389,
+            port: 3390,
             fps: 30,
             max_clients: 1,
             allow_control: true,
@@ -37,7 +37,9 @@ impl AppConfig {
     pub fn normalize(&mut self) {
         self.bind_address = self.bind_address.trim().to_string();
         self.fps = self.fps.clamp(1, 120);
-        self.max_clients = self.max_clients.clamp(1, 16);
+        // The current access screen owns one authentication state. Keep one
+        // client until authentication state is connection-scoped.
+        self.max_clients = 1;
         self.allowed_users = self
             .allowed_users
             .iter()

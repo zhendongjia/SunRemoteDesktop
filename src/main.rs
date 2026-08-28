@@ -9,7 +9,7 @@ use sun_remote_desktop::{admin, bridge, config, host, service};
 #[command(
     name = "sun-remote-desktop",
     version,
-    about = "Share the local desktop through the RDP transport"
+    about = "Share the local desktop through SunRDP"
 )]
 struct Cli {
     #[command(subcommand)]

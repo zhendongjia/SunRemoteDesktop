@@ -10,6 +10,7 @@ use rcgen::generate_simple_self_signed;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
+use crate::access::AccessGate;
 use crate::auth::LocalAccountValidator;
 use crate::config;
 use crate::display::{FrameHub, RdpDisplay};
@@ -72,12 +73,16 @@ async fn run_server_with_backend(
     injector: Arc<dyn InputInjector>,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
-    let display = RdpDisplay::new(hub, size);
-    let input = HostInputHandler::new(injector, size, settings.allow_control);
+    let access_gate = AccessGate::new(config_path.to_path_buf());
+    let display = RdpDisplay::new(hub, size, access_gate.clone());
+    let input = HostInputHandler::new(injector, size, settings.allow_control, access_gate.clone());
     let tls_acceptor =
         build_tls_acceptor(&config::certificate_path(), &config::private_key_path())?;
-    let validator = Arc::new(LocalAccountValidator::new(config_path.to_path_buf()));
-    let connections = ConnectionLimiter::new(settings.max_clients);
+    let validator = Arc::new(LocalAccountValidator::new(
+        config_path.to_path_buf(),
+        access_gate.clone(),
+    ));
+    let connections = ConnectionLimiter::new(settings.max_clients, access_gate);
 
     let addr: std::net::SocketAddr = format!("{}:{}", settings.bind_address, settings.port)
         .parse()
@@ -97,17 +102,17 @@ async fn run_server_with_backend(
         .with_connection_handler(Some(Box::new(connections)))
         .build();
 
-    tracing::info!(%addr, width = size.width, height = size.height, "RDP mirror server listening");
+    tracing::info!(%addr, width = size.width, height = size.height, "SunRDP server listening");
     if let Some(mut shutdown) = shutdown {
         tokio::select! {
-            result = server.run() => result.context("RDP server stopped"),
+            result = server.run() => result.context("SunRDP server stopped"),
             _ = wait_for_shutdown(&mut shutdown) => {
-                tracing::info!("RDP mirror server received the service stop request");
+                tracing::info!("SunRDP server received the service stop request");
                 Ok(())
             }
         }
     } else {
-        server.run().await.context("RDP server stopped")
+        server.run().await.context("SunRDP server stopped")
     }
 }
 
@@ -126,7 +131,7 @@ pub async fn run_service_server(
 
 fn validate_settings(settings: &config::AppConfig) -> Result<bool> {
     if !settings.enabled {
-        tracing::info!("RDP desktop host is disabled");
+        tracing::info!("SunRDP desktop host is disabled");
         return Ok(false);
     }
     if settings.allowed_users.is_empty() {
@@ -172,13 +177,15 @@ fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor> 
 struct ConnectionLimiter {
     active: AtomicU32,
     maximum: u32,
+    access_gate: AccessGate,
 }
 
 impl ConnectionLimiter {
-    fn new(maximum: u32) -> Self {
+    fn new(maximum: u32, access_gate: AccessGate) -> Self {
         Self {
             active: AtomicU32::new(0),
             maximum,
+            access_gate,
         }
     }
 }
@@ -191,6 +198,7 @@ impl ConnectionHandler for ConnectionLimiter {
             tracing::warn!(%peer, current, maximum = self.maximum, "RDP client rejected: connection limit reached");
             false
         } else {
+            self.access_gate.reset();
             tracing::info!(%peer, current, "RDP client accepted");
             true
         }
@@ -203,6 +211,7 @@ impl ConnectionHandler for ConnectionLimiter {
         _error: Option<&anyhow::Error>,
     ) -> PostConnectionAction {
         let remaining = self.active.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        self.access_gate.reset();
         tracing::info!(%peer, remaining, "RDP client disconnected");
         PostConnectionAction::Continue
     }

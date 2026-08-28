@@ -8,6 +8,7 @@ use ironrdp_server::{
 };
 use tokio::sync::watch;
 
+use crate::access::AccessGate;
 use crate::platform::{CapturedFrame, DesktopSize};
 
 #[derive(Clone)]
@@ -38,11 +39,16 @@ impl FrameHub {
 pub struct RdpDisplay {
     hub: FrameHub,
     size: DesktopSize,
+    access_gate: AccessGate,
 }
 
 impl RdpDisplay {
-    pub fn new(hub: FrameHub, size: DesktopSize) -> Self {
-        Self { hub, size }
+    pub fn new(hub: FrameHub, size: DesktopSize, access_gate: AccessGate) -> Self {
+        Self {
+            hub,
+            size,
+            access_gate,
+        }
     }
 }
 
@@ -58,6 +64,9 @@ impl RdpServerDisplay for RdpDisplay {
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
         Ok(Box::new(RdpDisplayUpdates {
             receiver: self.hub.subscribe(),
+            access: self.access_gate.subscribe(),
+            access_gate: self.access_gate.clone(),
+            size: self.size,
             sent_initial: false,
         }))
     }
@@ -65,6 +74,9 @@ impl RdpServerDisplay for RdpDisplay {
 
 struct RdpDisplayUpdates {
     receiver: watch::Receiver<Option<Arc<CapturedFrame>>>,
+    access: watch::Receiver<crate::access::AccessSnapshot>,
+    access_gate: AccessGate,
+    size: DesktopSize,
     sent_initial: bool,
 }
 
@@ -73,22 +85,52 @@ impl RdpServerDisplayUpdates for RdpDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
         if !self.sent_initial {
             self.sent_initial = true;
-            if let Some(frame) = self.receiver.borrow_and_update().as_ref().cloned() {
-                return Ok(Some(to_bitmap_update(&frame)?));
-            }
+            return Ok(Some(self.current_update()?));
         }
 
-        self.receiver
-            .changed()
-            .await
-            .context("display frame stream closed")?;
-        let frame = self
-            .receiver
-            .borrow_and_update()
-            .as_ref()
-            .cloned()
-            .context("display frame is unavailable")?;
-        Ok(Some(to_bitmap_update(&frame)?))
+        loop {
+            if self.access.borrow().is_authenticated() {
+                tokio::select! {
+                    changed = self.access.changed() => {
+                        changed.context("access state stream closed")?;
+                        self.access.borrow_and_update();
+                        return Ok(Some(self.current_update()?));
+                    }
+                    changed = self.receiver.changed() => {
+                        changed.context("display frame stream closed")?;
+                        return Ok(Some(self.current_update()?));
+                    }
+                }
+            } else {
+                tokio::select! {
+                    changed = self.access.changed() => {
+                        changed.context("access state stream closed")?;
+                        self.access.borrow_and_update();
+                        return Ok(Some(self.current_update()?));
+                    }
+                    changed = self.receiver.changed() => {
+                        changed.context("display frame stream closed")?;
+                        self.receiver.borrow_and_update();
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl RdpDisplayUpdates {
+    fn current_update(&mut self) -> Result<DisplayUpdate> {
+        if self.access.borrow().is_authenticated() {
+            let frame = self
+                .receiver
+                .borrow_and_update()
+                .as_ref()
+                .cloned()
+                .context("display frame is unavailable")?;
+            to_bitmap_update(&frame)
+        } else {
+            to_bitmap_update(&self.access_gate.render_frame(self.size))
+        }
     }
 }
 

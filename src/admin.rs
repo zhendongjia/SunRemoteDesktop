@@ -84,7 +84,7 @@ impl eframe::App for AdminApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("SunRemoteDesktop");
-            ui.label("使用 RDP 传输本地桌面画面；远程操作会注入到当前本地桌面。");
+            ui.label("使用 SunRDP 传输本地桌面画面；远程操作会注入到当前本地桌面。");
             ui.add_space(8.0);
 
             egui::Grid::new("server-settings")
@@ -103,7 +103,7 @@ impl eframe::App for AdminApp {
                     ui.add(egui::DragValue::new(&mut self.config.fps).range(1..=120));
                     ui.end_row();
                     ui.label("最大连接数");
-                    ui.add(egui::DragValue::new(&mut self.config.max_clients).range(1..=16));
+                    ui.label("1（当前认证模型暂不允许并发连接）");
                     ui.end_row();
                     ui.checkbox(&mut self.config.allow_control, "允许远程控制键盘和鼠标");
                     ui.end_row();

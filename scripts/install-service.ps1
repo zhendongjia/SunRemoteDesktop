@@ -3,12 +3,24 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $binary = Join-Path $projectRoot "target\release\sun-remote-desktop.exe"
 $serviceName = "SunRemoteDesktop"
+$ruleName = "SunRemoteDesktop (SunRDP)"
 $agentRunKey = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
 $agentRunName = "SunRemoteDesktopAgent"
 
 if (-not (Test-Path -LiteralPath $binary)) {
-    throw "未找到 $binary，请先执行 cargo build --release。"
+    throw "Binary not found: $binary. Run cargo build --release first."
 }
+
+# Stop agents from older installations before replacing the service. They all
+# use the same protected named pipe and an old agent can otherwise win the
+# first connection after the service is updated.
+Get-CimInstance Win32_Process -Filter "Name = 'sun-remote-desktop.exe'" |
+    Where-Object {
+        $_.CommandLine -match '(?i)(?:^|\s)agent(?:\s|$)'
+    } |
+    ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
 
 $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($null -ne $existing) {
@@ -23,7 +35,7 @@ New-Service `
     -Name $serviceName `
     -BinaryPathName "`"$binary`" service" `
     -DisplayName "SunRemoteDesktop" `
-    -Description "Share the current desktop through the RDP transport" `
+    -Description "Share the current desktop through SunRDP" `
     -StartupType Automatic | Out-Null
 
 $agentCommand = '"' + $binary + '" agent'
@@ -34,14 +46,27 @@ New-ItemProperty `
     -Value $agentCommand `
     -Force | Out-Null
 
+$configPath = & $binary config-path
+$port = 3390
+if (Test-Path -LiteralPath $configPath) {
+    $portSetting = Select-String `
+        -LiteralPath $configPath `
+        -Pattern '^\s*port\s*=\s*(\d+)\s*$' |
+        Select-Object -First 1
+    if ($null -ne $portSetting) {
+        $port = [int]$portSetting.Matches[0].Groups[1].Value
+    }
+}
+
+Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
 New-NetFirewallRule `
-    -DisplayName "SunRemoteDesktop (TCP 3389)" `
+    -DisplayName $ruleName `
     -Direction Inbound `
     -Action Allow `
     -Protocol TCP `
-    -LocalPort 3389 `
+    -LocalPort $port `
     -Profile Domain,Private | Out-Null
 
 Start-Service -Name $serviceName
 Start-Process -FilePath $binary -ArgumentList @("agent") -WindowStyle Hidden
-Write-Host "SunRemoteDesktop 服务已安装并启动；会话代理已启动，并会在以后每次登录时自动运行。"
+Write-Host "SunRemoteDesktop is installed. The SunRDP service and session agent are running on port $port."
