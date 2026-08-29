@@ -84,14 +84,24 @@ async fn run_server_with_backend(
         settings.allow_control,
         access_gate.clone(),
     );
-    let input = HostInputHandler::new(injector, hub, settings.allow_control, access_gate.clone());
+    let input = HostInputHandler::new(
+        Arc::clone(&injector),
+        hub.clone(),
+        settings.allow_control,
+        access_gate.clone(),
+    );
     let tls_acceptor =
         build_tls_acceptor(&config::certificate_path(), &config::private_key_path())?;
     let validator = Arc::new(LocalAccountValidator::new(
         config_path.to_path_buf(),
         access_gate.clone(),
     ));
-    let connections = ConnectionLimiter::new(settings.max_clients, access_gate);
+    let connections = ConnectionLimiter::new(
+        settings.max_clients,
+        access_gate,
+        hub,
+        Arc::clone(&injector),
+    );
 
     let addr: std::net::SocketAddr = format!("{}:{}", settings.bind_address, settings.port)
         .parse()
@@ -212,14 +222,25 @@ struct ConnectionLimiter {
     active: AtomicU32,
     maximum: u32,
     access_gate: AccessGate,
+    hub: FrameHub,
+    injector: Arc<dyn InputInjector>,
+    original_display_size: Option<DesktopSize>,
 }
 
 impl ConnectionLimiter {
-    fn new(maximum: u32, access_gate: AccessGate) -> Self {
+    fn new(
+        maximum: u32,
+        access_gate: AccessGate,
+        hub: FrameHub,
+        injector: Arc<dyn InputInjector>,
+    ) -> Self {
         Self {
             active: AtomicU32::new(0),
             maximum,
             access_gate,
+            hub,
+            injector,
+            original_display_size: None,
         }
     }
 }
@@ -232,6 +253,9 @@ impl ConnectionHandler for ConnectionLimiter {
             tracing::warn!(%peer, current, maximum = self.maximum, "RDP client rejected: connection limit reached");
             false
         } else {
+            if current == 1 {
+                self.original_display_size = Some(self.hub.size());
+            }
             self.access_gate.reset();
             tracing::info!(%peer, current, "RDP client accepted");
             true
@@ -246,6 +270,25 @@ impl ConnectionHandler for ConnectionLimiter {
     ) -> PostConnectionAction {
         let remaining = self.active.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
         self.access_gate.reset();
+        if remaining == 0
+            && let Some(original) = self.original_display_size.take()
+            && self.hub.size() != original
+        {
+            if let Err(restore_error) = self.injector.set_display_size(original) {
+                tracing::warn!(
+                    ?restore_error,
+                    width = original.width,
+                    height = original.height,
+                    "unable to restore the physical display mode after the last RDP client disconnected"
+                );
+            } else {
+                tracing::info!(
+                    width = original.width,
+                    height = original.height,
+                    "restoring the physical display mode after the last RDP client disconnected"
+                );
+            }
+        }
         if let Some(error) = error {
             tracing::warn!(%peer, remaining, ?error, "RDP client disconnected after an error");
         } else {
@@ -257,12 +300,64 @@ impl ConnectionHandler for ConnectionLimiter {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingInjector {
+        display_sizes: Mutex<Vec<DesktopSize>>,
+    }
+
+    impl InputInjector for RecordingInjector {
+        fn keyboard(&self, _event: &ironrdp_server::KeyboardEvent) {}
+
+        fn mouse(&self, _event: &ironrdp_server::MouseEvent, _desktop: DesktopSize) {}
+
+        fn set_display_size(&self, size: DesktopSize) -> Result<()> {
+            self.display_sizes.lock().unwrap().push(size);
+            Ok(())
+        }
+    }
 
     #[test]
     fn production_codec_offer_is_limited_to_nscodec() {
         let codecs = display_codecs();
         assert_eq!(codecs.0.len(), 1);
         assert!(matches!(codecs.0[0].property, CodecProperty::NsCodec(_)));
+    }
+
+    #[test]
+    fn last_client_disconnect_restores_the_original_display_mode() {
+        let original = DesktopSize {
+            width: 1366,
+            height: 768,
+        };
+        let changed = DesktopSize {
+            width: 1280,
+            height: 720,
+        };
+        let hub = FrameHub::new(original);
+        let injector = Arc::new(RecordingInjector::default());
+        let mut limiter = ConnectionLimiter::new(
+            1,
+            AccessGate::new("unused.toml".into()),
+            hub.clone(),
+            injector.clone(),
+        );
+        let peer = "127.0.0.1:3389".parse().unwrap();
+
+        assert!(limiter.on_accept(peer));
+        hub.publish(crate::platform::CapturedFrame {
+            width: changed.width,
+            height: changed.height,
+            rgba: vec![0; usize::from(changed.width) * usize::from(changed.height) * 4],
+        });
+        assert_eq!(
+            limiter.on_disconnected(peer, std::time::Duration::ZERO, None),
+            PostConnectionAction::Continue
+        );
+
+        assert_eq!(*injector.display_sizes.lock().unwrap(), vec![original]);
     }
 }

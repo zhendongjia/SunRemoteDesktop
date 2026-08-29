@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Gdi::{
-    CDS_UPDATEREGISTRY, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL, DM_PELSHEIGHT,
+    CDS_FULLSCREEN, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL, DM_PELSHEIGHT,
     DM_PELSWIDTH, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE, EnumDisplaySettingsW,
 };
 use windows::Win32::Security::{LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT, LogonUserW};
@@ -319,8 +319,10 @@ fn set_primary_display_size(size: DesktopSize) -> Result<()> {
     mode.dmPelsWidth = u32::from(selected.width);
     mode.dmPelsHeight = u32::from(selected.height);
     mode.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT;
-    let result =
-        unsafe { ChangeDisplaySettingsExW(None, Some(&mode), None, CDS_UPDATEREGISTRY, None) };
+    // A client-sized mode is session presentation state, not a permanent local
+    // preference. Keep it temporary so a service or machine restart cannot
+    // leave the physical console at a remote client's resolution.
+    let result = unsafe { ChangeDisplaySettingsExW(None, Some(&mode), None, CDS_FULLSCREEN, None) };
     anyhow::ensure!(
         result == DISP_CHANGE_SUCCESSFUL,
         "Windows rejected the requested {}x{} display mode with status {}",
@@ -364,9 +366,25 @@ fn supported_primary_display_sizes() -> Result<Vec<DesktopSize>> {
 }
 
 fn closest_display_size(requested: DesktopSize, supported: &[DesktopSize]) -> Option<DesktopSize> {
-    supported.iter().copied().min_by(|left, right| {
+    let requested_pixels = display_pixel_count(requested);
+    let compare = |left: &DesktopSize, right: &DesktopSize| {
         display_mode_score(requested, *left).total_cmp(&display_mode_score(requested, *right))
-    })
+    };
+    supported
+        .iter()
+        .copied()
+        .filter(|candidate| display_pixel_count(*candidate) <= requested_pixels)
+        .min_by(compare)
+        .or_else(|| {
+            // Very small client windows can be below the minimum physical
+            // mode. In that case there is no alternative to choosing the
+            // closest supported mode and scaling it down.
+            supported.iter().copied().min_by(compare)
+        })
+}
+
+fn display_pixel_count(size: DesktopSize) -> u64 {
+    u64::from(size.width) * u64::from(size.height)
 }
 
 fn display_mode_score(requested: DesktopSize, candidate: DesktopSize) -> f64 {
@@ -446,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn display_mode_selection_prefers_aspect_ratio_then_size() {
+    fn display_mode_selection_does_not_make_a_client_desktop_denser() {
         let modes = [
             DesktopSize {
                 width: 1920,
@@ -470,9 +488,62 @@ mod tests {
                 &modes
             ),
             Some(DesktopSize {
-                width: 1680,
-                height: 1050,
+                width: 1280,
+                height: 1024,
             })
+        );
+    }
+
+    #[test]
+    fn macos_windows_app_uses_a_smaller_physical_mode() {
+        let modes = [
+            DesktopSize {
+                width: 800,
+                height: 600,
+            },
+            DesktopSize {
+                width: 1366,
+                height: 768,
+            },
+            DesktopSize {
+                width: 1920,
+                height: 1080,
+            },
+            DesktopSize {
+                width: 1920,
+                height: 1200,
+            },
+        ];
+        assert_eq!(
+            closest_display_size(
+                DesktopSize {
+                    width: 1440,
+                    height: 900,
+                },
+                &modes
+            ),
+            Some(DesktopSize {
+                width: 1366,
+                height: 768,
+            })
+        );
+    }
+
+    #[test]
+    fn display_mode_selection_falls_back_when_every_mode_is_larger() {
+        let mode = DesktopSize {
+            width: 800,
+            height: 600,
+        };
+        assert_eq!(
+            closest_display_size(
+                DesktopSize {
+                    width: 640,
+                    height: 480,
+                },
+                &[mode]
+            ),
+            Some(mode)
         );
     }
 

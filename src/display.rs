@@ -302,19 +302,34 @@ impl RdpServerDisplay for RdpDisplay {
             );
             return;
         }
-        let (width, height) = monitors[0].dimensions();
+        let monitor = &monitors[0];
+        let (width, height) = monitor.dimensions();
         let (Ok(width), Ok(height)) = (u16::try_from(width), u16::try_from(height)) else {
             tracing::warn!(width, height, "client dynamic resolution is out of range");
             return;
         };
         let requested = DesktopSize { width, height };
+        let desktop_scale_factor = monitor.desktop_scale_factor();
+        let device_scale_factor = monitor.device_scale_factor();
+        let physical_dimensions_mm = monitor.physical_dimensions();
         if *self.client_size.borrow() == requested {
+            tracing::info!(
+                width,
+                height,
+                desktop_scale_factor = ?desktop_scale_factor,
+                device_scale_factor = ?device_scale_factor,
+                physical_dimensions_mm = ?physical_dimensions_mm,
+                "SunRDP received client display metrics for the current resolution"
+            );
             return;
         }
 
         tracing::info!(
             width,
             height,
+            desktop_scale_factor = ?desktop_scale_factor,
+            device_scale_factor = ?device_scale_factor,
+            physical_dimensions_mm = ?physical_dimensions_mm,
             "SunRDP received a dynamic client-resolution request"
         );
         self.pending_layout = Some((self.access_gate.connection_generation(), requested));
