@@ -69,4 +69,8 @@ New-NetFirewallRule `
 
 Start-Service -Name $serviceName
 Start-Process -FilePath $binary -ArgumentList @("agent") -WindowStyle Hidden
-Write-Host "SunRemoteDesktop is installed. The SunRDP service and session agent are running on port $port."
+$binaryHash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash
+& (Join-Path $PSScriptRoot 'install-maintenance.ps1') `
+    -CandidateBinary $binary `
+    -ExpectedSha256 $binaryHash | Out-Null
+Write-Host "SunRemoteDesktop and its restricted maintenance entry are installed. SunRDP and the session agent are running on port $port."

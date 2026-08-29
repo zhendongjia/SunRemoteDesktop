@@ -4,8 +4,12 @@ $serviceName = "SunRemoteDesktop"
 $ruleName = "SunRemoteDesktop (SunRDP)"
 $agentRunKey = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
 $agentRunName = "SunRemoteDesktopAgent"
+$maintenanceTaskName = "SunRemoteDesktop Maintenance"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $binary = Join-Path $projectRoot "target\release\sun-remote-desktop.exe"
+$installedRoot = Join-Path $env:ProgramFiles "SunRemoteDesktop"
+$maintenanceRoot = Join-Path $env:ProgramData "SunRemoteDesktop\Maintenance"
+$maintenanceQueue = Join-Path $env:ProgramData "SunRemoteDesktop\MaintenanceQueue"
 
 $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($null -ne $existing) {
@@ -22,7 +26,10 @@ Remove-ItemProperty `
 
 Get-CimInstance Win32_Process -Filter "Name = 'sun-remote-desktop.exe'" |
     Where-Object {
-        $_.ExecutablePath -eq $binary -and
+        -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) -and
+        ($_.ExecutablePath -eq $binary -or $_.ExecutablePath.StartsWith(
+            $installedRoot + '\', [StringComparison]::OrdinalIgnoreCase
+        )) -and
         $_.CommandLine -match '(?i)(?:^|\s)agent(?:\s|$)'
     } |
     ForEach-Object {
@@ -32,4 +39,8 @@ Get-CimInstance Win32_Process -Filter "Name = 'sun-remote-desktop.exe'" |
 Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
 Remove-NetFirewallRule -DisplayName "SunRemoteDesktop (RDP Transport)" -ErrorAction SilentlyContinue
 Remove-NetFirewallRule -DisplayName "SunRemoteDesktop (TCP 3389)" -ErrorAction SilentlyContinue
-Write-Host "SunRemoteDesktop service, agent autorun, and firewall rule were removed. Configuration and certificates were preserved."
+Unregister-ScheduledTask -TaskName $maintenanceTaskName -Confirm:$false -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $maintenanceRoot -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $maintenanceQueue -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $installedRoot -Recurse -Force -ErrorAction SilentlyContinue
+Write-Host "SunRemoteDesktop service, maintenance task, installed binaries, agent autorun, and firewall rule were removed. Configuration and certificates were preserved."

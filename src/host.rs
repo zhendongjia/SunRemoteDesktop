@@ -5,6 +5,9 @@ use std::sync::{
 };
 
 use anyhow::{Context, Result};
+use ironrdp_pdu::rdp::capability_sets::{
+    BitmapCodecs, Codec, CodecProperty, NsCodec, server_codecs_capabilities,
+};
 use ironrdp_server::{ConnectionHandler, PostConnectionAction, RdpServer};
 use rcgen::generate_simple_self_signed;
 use tokio::sync::watch;
@@ -98,6 +101,7 @@ async fn run_server_with_backend(
         .with_tls(tls_acceptor)
         .with_input_handler(input)
         .with_display_handler(display)
+        .with_bitmap_codecs(display_codecs()?)
         .with_credential_validator(Some(validator))
         .with_connection_handler(Some(Box::new(connections)))
         .build();
@@ -114,6 +118,22 @@ async fn run_server_with_backend(
     } else {
         server.run().await.context("SunRDP server stopped")
     }
+}
+
+fn display_codecs() -> Result<BitmapCodecs> {
+    let mut codecs = server_codecs_capabilities(&[]).map_err(anyhow::Error::msg)?;
+    // Some clients advertise NSCodec but neither RemoteFX nor the QOI codecs.
+    // Without this capability AND the server's nscodec feature they fall back
+    // to uncompressed surface updates (about 12.5 MB for a 2556x1224 frame).
+    codecs.0.push(Codec {
+        id: 0,
+        property: CodecProperty::NsCodec(NsCodec {
+            is_dynamic_fidelity_allowed: false,
+            is_subsampling_allowed: false,
+            color_loss_level: 1,
+        }),
+    });
+    Ok(codecs)
 }
 
 #[cfg(not(windows))]
