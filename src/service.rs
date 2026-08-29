@@ -1,6 +1,7 @@
 #[cfg(windows)]
 mod windows_service_impl {
     use std::ffi::OsString;
+    use std::io::Write;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -13,9 +14,10 @@ mod windows_service_impl {
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::service_dispatcher;
 
-    use crate::{config, host};
+    use crate::{bridge, config, host};
 
     const SERVICE_NAME: &str = "SunRemoteDesktop";
+    const MAINTENANCE_WORKER: &str = include_str!("../scripts/maintenance-worker.ps1");
 
     pub fn run() -> Result<()> {
         service_dispatcher::start(SERVICE_NAME, ffi_service_main)
@@ -52,7 +54,19 @@ mod windows_service_impl {
             process_id: None,
         })?;
 
+        schedule_maintenance_worker_refresh();
+
         let config_path = config::config_path();
+        let console_agent_config = config_path.clone();
+        let (console_agent_shutdown_sender, console_agent_shutdown_receiver) = mpsc::channel();
+        let console_agent_thread = std::thread::Builder::new()
+            .name("sunrdp-console-agent-supervisor".to_string())
+            .spawn(move || {
+                bridge::windows::supervise_console_agent(
+                    console_agent_config,
+                    console_agent_shutdown_receiver,
+                );
+            })?;
         let (runtime_shutdown_sender, runtime_shutdown_receiver) =
             tokio::sync::watch::channel(false);
         let (done_sender, done_receiver) = mpsc::channel();
@@ -75,9 +89,11 @@ mod windows_service_impl {
             if shutdown_receiver.try_recv().is_ok() {
                 stop_requested = true;
                 let _ = runtime_shutdown_sender.send(true);
+                let _ = console_agent_shutdown_sender.send(());
                 break;
             }
             if let Ok(result) = done_receiver.try_recv() {
+                let _ = console_agent_shutdown_sender.send(());
                 if let Err(error) = result {
                     status_handle.set_service_status(ServiceStatus {
                         service_type: ServiceType::OWN_PROCESS,
@@ -104,6 +120,7 @@ mod windows_service_impl {
                 }
             }
         }
+        let _ = console_agent_thread.join();
 
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
@@ -115,6 +132,55 @@ mod windows_service_impl {
             process_id: None,
         })?;
         Ok(())
+    }
+
+    fn schedule_maintenance_worker_refresh() {
+        let maintenance_root = config::data_dir().join("Maintenance");
+        let policy_path = maintenance_root.join("policy.json");
+        let worker_path = maintenance_root.join("maintenance-worker.ps1");
+        std::thread::spawn(move || {
+            // During Deploy, the previous worker is still running while the
+            // new service starts. Retry until PowerShell releases the script.
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_secs(1));
+                if !policy_path.is_file() {
+                    return;
+                }
+                if std::fs::read_to_string(&worker_path).ok().as_deref() == Some(MAINTENANCE_WORKER)
+                {
+                    return;
+                }
+                let write_result = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&worker_path)
+                    .and_then(|mut file| {
+                        file.write_all(MAINTENANCE_WORKER.as_bytes())?;
+                        file.sync_all()
+                    });
+                match write_result {
+                    Ok(()) => {
+                        tracing::info!(
+                            path = %worker_path.display(),
+                            "protected maintenance worker refreshed"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            ?error,
+                            path = %worker_path.display(),
+                            "maintenance worker is busy; retrying"
+                        );
+                    }
+                }
+            }
+            tracing::warn!(
+                path = %worker_path.display(),
+                "unable to refresh the protected maintenance worker"
+            );
+        });
     }
 }
 

@@ -146,7 +146,11 @@ function Get-ConfiguredPort([string]$ConfigPath) {
 }
 
 function Set-HostFirewall([string]$RuleName, [int]$Port) {
+    $publicRuleName = "$RuleName (Public local subnet)"
+    $tailscaleRuleName = "$RuleName (Tailscale)"
     Remove-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue
+    Remove-NetFirewallRule -DisplayName $publicRuleName -ErrorAction SilentlyContinue
+    Remove-NetFirewallRule -DisplayName $tailscaleRuleName -ErrorAction SilentlyContinue
     New-NetFirewallRule `
         -DisplayName $RuleName `
         -Direction Inbound `
@@ -154,9 +158,40 @@ function Set-HostFirewall([string]$RuleName, [int]$Port) {
         -Protocol TCP `
         -LocalPort $Port `
         -Profile Domain,Private | Out-Null
+    New-NetFirewallRule `
+        -DisplayName $publicRuleName `
+        -Direction Inbound `
+        -Action Allow `
+        -Protocol TCP `
+        -LocalPort $Port `
+        -RemoteAddress LocalSubnet `
+        -Profile Public | Out-Null
+    $tailscaleAliases = @(
+        Get-NetAdapter -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -eq 'Tailscale' -or
+                $_.InterfaceDescription -like '*Tailscale*'
+            } |
+            Select-Object -ExpandProperty Name -Unique
+    )
+    if ($tailscaleAliases.Count -gt 0) {
+        New-NetFirewallRule `
+            -DisplayName $tailscaleRuleName `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort $Port `
+            -RemoteAddress '100.64.0.0/10','fd7a:115c:a1e0::/48' `
+            -InterfaceAlias $tailscaleAliases `
+            -Profile Any | Out-Null
+    }
 }
 
-function Wait-HostReady([string]$ServiceName, [int]$Port) {
+function Wait-HostReady(
+    [string]$ServiceName,
+    [int]$Port,
+    [switch]$AllowWaitingForAgent
+) {
     $deadline = [DateTime]::UtcNow.AddSeconds(25)
     do {
         $service = Get-ServiceInfo $ServiceName
@@ -167,6 +202,10 @@ function Wait-HostReady([string]$ServiceName, [int]$Port) {
         }
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
+    $service = Get-ServiceInfo $ServiceName
+    if ($AllowWaitingForAgent -and $service.State -eq 'Running') {
+        return $service
+    }
     throw "SunRDP did not become ready on TCP $Port."
 }
 
@@ -183,6 +222,21 @@ function Get-InstalledBinary([string]$ServiceName, [string]$InstallRoot) {
         throw 'The installed SunRemoteDesktop executable is missing.'
     }
     return $binary
+}
+
+function Get-SessionAgents {
+    return @(
+        Get-CimInstance Win32_Process -Filter "Name='sun-remote-desktop.exe'" |
+            Where-Object {
+                $_.CommandLine -match '(?i)(?:^|\s)(?:console-agent|agent)(?:\s|$)'
+            }
+    )
+}
+
+function Stop-SessionAgents {
+    foreach ($agent in Get-SessionAgents) {
+        Stop-Process -Id $agent.ProcessId -Force -ErrorAction SilentlyContinue
+    }
 }
 
 try {
@@ -224,8 +278,8 @@ try {
     $targetRoot = Join-Path $projectRoot 'target'
     $configPath = [IO.Path]::GetFullPath([string]$policy.ConfigPath)
     $maintainerSid = [string]$policy.MaintainerSid
-    $runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
-    $runName = 'SunRemoteDesktopAgent'
+    $legacyRunKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $legacyRunName = 'SunRemoteDesktopAgent'
     $port = Get-ConfiguredPort $configPath
 
     switch ([string]$request.Action) {
@@ -275,17 +329,18 @@ try {
 
                 $oldService = Get-ServiceInfo $serviceName
                 $oldServicePath = [string]$oldService.PathName
-                $oldAgentCommand = (Get-ItemProperty -LiteralPath $runKey -Name $runName -ErrorAction SilentlyContinue).$runName
+                $oldAgentCommand = (Get-ItemProperty -LiteralPath $legacyRunKey -Name $legacyRunName -ErrorAction SilentlyContinue).$legacyRunName
                 $serviceChanged = $false
                 try {
                     Set-HostFirewall $ruleName $port
                     Stop-HostService $serviceName
+                    Stop-SessionAgents
                     Set-ServiceBinary $serviceName ('"' + $installedBinary + '" service')
                     $serviceChanged = $true
                     Set-Service -Name $serviceName -StartupType Automatic
-                    Set-ItemProperty -LiteralPath $runKey -Name $runName -Value ('"' + $installedBinary + '" agent')
+                    Remove-ItemProperty -LiteralPath $legacyRunKey -Name $legacyRunName -ErrorAction SilentlyContinue
                     Start-HostService $serviceName
-                    $running = Wait-HostReady $serviceName $port
+                    $running = Wait-HostReady $serviceName $port -AllowWaitingForAgent
                 } catch {
                     $deploymentError = $_.Exception.Message
                     if ($serviceChanged -or (Get-Service -Name $serviceName).Status -ne 'Running') {
@@ -293,11 +348,14 @@ try {
                             Stop-HostService $serviceName
                             Set-ServiceBinary $serviceName $oldServicePath
                             if ($null -ne $oldAgentCommand) {
-                                Set-ItemProperty -LiteralPath $runKey -Name $runName -Value $oldAgentCommand
+                                Set-ItemProperty -LiteralPath $legacyRunKey -Name $legacyRunName -Value $oldAgentCommand
                             } else {
-                                Remove-ItemProperty -LiteralPath $runKey -Name $runName -ErrorAction SilentlyContinue
+                                Remove-ItemProperty -LiteralPath $legacyRunKey -Name $legacyRunName -ErrorAction SilentlyContinue
                             }
                             Start-HostService $serviceName
+                            if ($oldAgentCommand -match '^"([^"]+)"\s+agent$') {
+                                Start-Process -FilePath $Matches[1] -ArgumentList @('agent') -WindowStyle Hidden
+                            }
                             $result.RolledBack = $true
                         } catch {
                             $deploymentError += '; rollback failed: ' + $_.Exception.Message
@@ -319,7 +377,16 @@ try {
             $installedBinary = Get-InstalledBinary $serviceName $installRoot
             Stop-HostService $serviceName
             Start-HostService $serviceName
-            $running = Wait-HostReady $serviceName $port
+            $running = Wait-HostReady $serviceName $port -AllowWaitingForAgent
+            $result.Binary = $installedBinary
+            $result.Port = $port
+            $result.ProcessId = $running.ProcessId
+        }
+        'RestartAgent' {
+            $installedBinary = Get-InstalledBinary $serviceName $installRoot
+            Stop-SessionAgents
+            Start-Sleep -Milliseconds 500
+            $running = Wait-HostReady $serviceName $port -AllowWaitingForAgent
             $result.Binary = $installedBinary
             $result.Port = $port
             $result.ProcessId = $running.ProcessId
@@ -327,10 +394,10 @@ try {
         'Repair' {
             $installedBinary = Get-InstalledBinary $serviceName $installRoot
             Set-Service -Name $serviceName -StartupType Automatic
-            Set-ItemProperty -LiteralPath $runKey -Name $runName -Value ('"' + $installedBinary + '" agent')
+            Remove-ItemProperty -LiteralPath $legacyRunKey -Name $legacyRunName -ErrorAction SilentlyContinue
             Set-HostFirewall $ruleName $port
             Start-HostService $serviceName
-            $running = Wait-HostReady $serviceName $port
+            $running = Wait-HostReady $serviceName $port -AllowWaitingForAgent
             $result.Binary = $installedBinary
             $result.Port = $port
             $result.ProcessId = $running.ProcessId

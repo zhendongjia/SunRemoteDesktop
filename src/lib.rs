@@ -8,5 +8,6 @@ pub mod host;
 pub mod input;
 pub mod platform;
 pub mod service;
+pub mod touch;
 
 pub const PRODUCT_NAME: &str = "SunRemoteDesktop";

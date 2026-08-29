@@ -11,17 +11,21 @@
 
 ## Phase 2 — Windows service and session bridge
 
-- [x] Move Windows capture and input into a per-session agent.
+- [x] Move Windows capture and input into a service-managed physical-console agent.
 - [x] Add a named-pipe protocol with versioning, frame back-pressure and ACL checks.
-- [ ] Let the service track logon/logoff/session-lock events.
-- [x] Register the session agent to start automatically at interactive logon.
+- [x] Follow active-console Session changes and `default`/`winlogon`/`screensaver` input-desktop changes.
+- [x] Start the physical-console agent from the service without requiring an interactive logon.
 - [ ] Add service status and agent status to the administration UI.
-- [ ] Decide explicitly how secure desktop and UAC prompts are handled; do not silently weaken Windows security boundaries.
+- [x] Capture the physical console's login, lock and UAC input desktops through a LocalSystem helper without weakening Windows security boundaries.
 
 ## Phase 3 — Shared capabilities
 
 - [ ] Read-only mode and per-user control policy.
-- [ ] Multiple monitor layout and client-requested scaling.
+- [x] Single-monitor client-sized access UI, explicit scaling and primary-display matching.
+- [x] Single-monitor dynamic Display Control resizing with per-connection scale/match policy.
+- [x] MS-RDPEI primary-contact input for direct-touch taps and single-finger drags.
+- [ ] Native multi-touch gestures and pen forwarding.
+- [ ] Multiple-monitor Display Control layouts.
 - [ ] Clipboard, audio and optional file-transfer channels, each disabled by default.
 - [ ] Certificate import, rotation, fingerprint display and audit logs.
 - [ ] Connection metrics, frame pacing and adaptive quality.

@@ -22,6 +22,7 @@ pub trait DesktopCapture: Send {
 pub trait InputInjector: Send + Sync {
     fn keyboard(&self, event: &ironrdp_server::KeyboardEvent);
     fn mouse(&self, event: &ironrdp_server::MouseEvent, desktop: DesktopSize);
+    fn set_display_size(&self, size: DesktopSize) -> Result<()>;
 }
 
 #[cfg(windows)]
@@ -52,5 +53,9 @@ pub mod unsupported {
     impl InputInjector for UnsupportedInput {
         fn keyboard(&self, _event: &ironrdp_server::KeyboardEvent) {}
         fn mouse(&self, _event: &ironrdp_server::MouseEvent, _desktop: DesktopSize) {}
+
+        fn set_display_size(&self, _size: DesktopSize) -> Result<()> {
+            bail!("display mode changes are not supported on this platform")
+        }
     }
 }

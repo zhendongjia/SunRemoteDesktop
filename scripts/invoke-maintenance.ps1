@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Deploy', 'Restart', 'Repair')]
+    [ValidateSet('Deploy', 'Restart', 'RestartAgent', 'Repair')]
     [string]$Action,
     [string]$CandidateBinary,
     [ValidatePattern('^[A-Fa-f0-9]{64}$')]

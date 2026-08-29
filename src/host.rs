@@ -5,9 +5,7 @@ use std::sync::{
 };
 
 use anyhow::{Context, Result};
-use ironrdp_pdu::rdp::capability_sets::{
-    BitmapCodecs, Codec, CodecProperty, NsCodec, server_codecs_capabilities,
-};
+use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, Codec, CodecProperty, NsCodec};
 use ironrdp_server::{ConnectionHandler, PostConnectionAction, RdpServer};
 use rcgen::generate_simple_self_signed;
 use tokio::sync::watch;
@@ -19,6 +17,7 @@ use crate::config;
 use crate::display::{FrameHub, RdpDisplay};
 use crate::input::HostInputHandler;
 use crate::platform::{DesktopCapture, DesktopSize, InputInjector};
+use crate::touch::DirectTouchFactory;
 
 #[cfg(windows)]
 pub async fn run_server(config_path: &Path) -> Result<()> {
@@ -77,8 +76,15 @@ async fn run_server_with_backend(
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     let access_gate = AccessGate::new(config_path.to_path_buf());
-    let display = RdpDisplay::new(hub, size, access_gate.clone());
-    let input = HostInputHandler::new(injector, size, settings.allow_control, access_gate.clone());
+    let display =
+        RdpDisplay::with_dynamic_resize(hub.clone(), access_gate.clone(), Arc::clone(&injector));
+    let touch = DirectTouchFactory::new(
+        Arc::clone(&injector),
+        hub.clone(),
+        settings.allow_control,
+        access_gate.clone(),
+    );
+    let input = HostInputHandler::new(injector, hub, settings.allow_control, access_gate.clone());
     let tls_acceptor =
         build_tls_acceptor(&config::certificate_path(), &config::private_key_path())?;
     let validator = Arc::new(LocalAccountValidator::new(
@@ -96,12 +102,18 @@ async fn run_server_with_backend(
             )
         })?;
 
+    tracing::info!("SunRDP graphics policy uses the Windows App compatible NSCodec path");
     let mut server = RdpServer::builder()
         .with_addr(addr)
         .with_tls(tls_acceptor)
         .with_input_handler(input)
         .with_display_handler(display)
-        .with_bitmap_codecs(display_codecs()?)
+        .with_rdpei_factory(Some(Box::new(touch)))
+        .with_honor_client_desktop_size(Some(ironrdp_server::DesktopSize {
+            width: 8192,
+            height: 8192,
+        }))
+        .with_bitmap_codecs(display_codecs())
         .with_credential_validator(Some(validator))
         .with_connection_handler(Some(Box::new(connections)))
         .build();
@@ -120,11 +132,13 @@ async fn run_server_with_backend(
     }
 }
 
-fn display_codecs() -> Result<BitmapCodecs> {
-    let mut codecs = server_codecs_capabilities(&[]).map_err(anyhow::Error::msg)?;
-    // Some clients advertise NSCodec but neither RemoteFX nor the QOI codecs.
-    // Without this capability AND the server's nscodec feature they fall back
-    // to uncompressed surface updates (about 12.5 MB for a 2556x1224 frame).
+fn display_codecs() -> BitmapCodecs {
+    // Recent Windows App builds may advertise the standalone RemoteFX codec,
+    // ACK its surface updates, and still leave the legacy surface black. Keep
+    // the production offer to NSCodec until codec selection can be based on a
+    // tested client profile. Clients without NSCodec safely fall back to the
+    // standard bitmap path.
+    let mut codecs = BitmapCodecs::default();
     codecs.0.push(Codec {
         id: 0,
         property: CodecProperty::NsCodec(NsCodec {
@@ -133,7 +147,7 @@ fn display_codecs() -> Result<BitmapCodecs> {
             color_loss_level: 1,
         }),
     });
-    Ok(codecs)
+    codecs
 }
 
 #[cfg(not(windows))]
@@ -228,11 +242,27 @@ impl ConnectionHandler for ConnectionLimiter {
         &mut self,
         peer: std::net::SocketAddr,
         _duration: std::time::Duration,
-        _error: Option<&anyhow::Error>,
+        error: Option<&anyhow::Error>,
     ) -> PostConnectionAction {
         let remaining = self.active.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
         self.access_gate.reset();
-        tracing::info!(%peer, remaining, "RDP client disconnected");
+        if let Some(error) = error {
+            tracing::warn!(%peer, remaining, ?error, "RDP client disconnected after an error");
+        } else {
+            tracing::info!(%peer, remaining, "RDP client disconnected");
+        }
         PostConnectionAction::Continue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_codec_offer_is_limited_to_nscodec() {
+        let codecs = display_codecs();
+        assert_eq!(codecs.0.len(), 1);
+        assert!(matches!(codecs.0[0].property, CodecProperty::NsCodec(_)));
     }
 }

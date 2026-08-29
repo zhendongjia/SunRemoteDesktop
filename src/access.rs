@@ -1,8 +1,9 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use font8x8::{BASIC_FONTS, UnicodeFonts};
-use ironrdp_server::KeyboardEvent;
+use fontdue::{Font, FontSettings};
+use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent};
 use tokio::sync::watch;
 use zeroize::Zeroizing;
 
@@ -28,12 +29,37 @@ pub struct AccessSnapshot {
     focus: AccessField,
     status: AccessStatus,
     authenticated: bool,
+    client_size: Option<DesktopSize>,
+    host_size: Option<DesktopSize>,
+    host_available: bool,
+    resolution_selection: ResolutionSelection,
+    resolution_policy: Option<ResolutionSelection>,
+    presentation: Option<DesktopPresentation>,
 }
 
 impl AccessSnapshot {
-    pub fn is_authenticated(&self) -> bool {
-        self.authenticated
+    pub fn is_desktop_ready(&self) -> bool {
+        self.authenticated && self.presentation.is_some()
     }
+
+    pub fn presentation(&self) -> Option<DesktopPresentation> {
+        self.presentation
+    }
+
+    pub fn client_size(&self) -> Option<DesktopSize> {
+        self.client_size
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesktopPresentation {
+    Native,
+    Scale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessAction {
+    ChangeDisplaySize(DesktopSize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,12 +69,20 @@ enum AccessField {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolutionSelection {
+    Scale,
+    MatchDisplay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AccessStatus {
     Ready,
     MissingCredentials,
     Checking,
     Rejected,
     BackendError,
+    ResolutionRequired,
+    WaitingForDesktop,
     Granted,
 }
 
@@ -61,6 +95,13 @@ struct AccessState {
     shift: bool,
     caps_lock: bool,
     generation: u64,
+    client_size: Option<DesktopSize>,
+    host_size: Option<DesktopSize>,
+    host_available: bool,
+    resolution_selection: ResolutionSelection,
+    resolution_policy: Option<ResolutionSelection>,
+    presentation: Option<DesktopPresentation>,
+    pointer: (u16, u16),
 }
 
 impl Default for AccessState {
@@ -74,6 +115,13 @@ impl Default for AccessState {
             shift: false,
             caps_lock: false,
             generation: 0,
+            client_size: None,
+            host_size: None,
+            host_available: false,
+            resolution_selection: ResolutionSelection::Scale,
+            resolution_policy: None,
+            presentation: None,
+            pointer: (0, 0),
         }
     }
 }
@@ -86,6 +134,12 @@ impl AccessState {
             focus: self.focus,
             status: self.status,
             authenticated: self.authenticated,
+            client_size: self.client_size,
+            host_size: self.host_size,
+            host_available: self.host_available,
+            resolution_selection: self.resolution_selection,
+            resolution_policy: self.resolution_policy,
+            presentation: self.presentation,
         }
     }
 }
@@ -107,18 +161,144 @@ impl AccessGate {
         self.inner.sender.subscribe()
     }
 
-    pub fn is_authenticated(&self) -> bool {
-        self.lock_state().authenticated
+    pub fn snapshot(&self) -> AccessSnapshot {
+        self.lock_state().snapshot()
+    }
+
+    pub(crate) fn connection_generation(&self) -> u64 {
+        self.lock_state().generation
+    }
+
+    pub fn is_desktop_ready(&self) -> bool {
+        self.lock_state().snapshot().is_desktop_ready()
     }
 
     pub fn reset(&self) {
         let mut state = self.lock_state();
         let generation = state.generation.wrapping_add(1);
+        let host_size = state.host_size;
+        let host_available = state.host_available;
         *state = AccessState {
             generation,
+            host_size,
+            host_available,
             ..AccessState::default()
         };
         self.publish(&state);
+    }
+
+    pub fn set_display_sizes(&self, client_size: DesktopSize, host_size: DesktopSize) {
+        self.set_display_state(client_size, host_size, true);
+    }
+
+    /// Applies a client-side dynamic-resolution request.
+    ///
+    /// The physical console follows the client only after the user explicitly
+    /// selected the "match physical display" option for this connection. In
+    /// scaling mode the RDP canvas still follows the client, but the host mode
+    /// remains untouched.
+    pub fn request_client_resize(&self, client_size: DesktopSize) -> Option<AccessAction> {
+        let mut state = self.lock_state();
+        let old_snapshot = state.snapshot();
+        state.client_size = Some(client_size);
+
+        let action = if !state.authenticated {
+            None
+        } else if !state.host_available {
+            state.presentation = None;
+            state.status = AccessStatus::WaitingForDesktop;
+            None
+        } else {
+            let matches_host = state.host_size == Some(client_size);
+            match state.resolution_policy {
+                Some(ResolutionSelection::Scale) => {
+                    state.presentation = Some(if matches_host {
+                        DesktopPresentation::Native
+                    } else {
+                        DesktopPresentation::Scale
+                    });
+                    state.status = AccessStatus::Granted;
+                    None
+                }
+                Some(ResolutionSelection::MatchDisplay) => {
+                    state.presentation = Some(if matches_host {
+                        DesktopPresentation::Native
+                    } else {
+                        DesktopPresentation::Scale
+                    });
+                    state.status = AccessStatus::Granted;
+                    (!matches_host).then_some(AccessAction::ChangeDisplaySize(client_size))
+                }
+                None if matches_host => {
+                    // No choice is necessary when both sides already match. A
+                    // later resize defaults to the non-invasive scaling policy.
+                    state.resolution_policy = Some(ResolutionSelection::Scale);
+                    state.presentation = Some(DesktopPresentation::Native);
+                    state.status = AccessStatus::Granted;
+                    None
+                }
+                None => {
+                    state.presentation = None;
+                    state.status = AccessStatus::ResolutionRequired;
+                    None
+                }
+            }
+        };
+
+        if state.snapshot() != old_snapshot {
+            self.publish(&state);
+        }
+        action
+    }
+
+    pub fn should_follow_client_size(&self, client_size: DesktopSize) -> bool {
+        let state = self.lock_state();
+        state.authenticated
+            && state.host_available
+            && state.resolution_policy == Some(ResolutionSelection::MatchDisplay)
+            && state.client_size == Some(client_size)
+    }
+
+    pub fn set_display_state(
+        &self,
+        client_size: DesktopSize,
+        host_size: DesktopSize,
+        host_available: bool,
+    ) {
+        let mut state = self.lock_state();
+        let old_snapshot = state.snapshot();
+        state.client_size = Some(client_size);
+        state.host_size = Some(host_size);
+        state.host_available = host_available;
+
+        if state.authenticated {
+            if !host_available {
+                state.presentation = None;
+                state.status = AccessStatus::WaitingForDesktop;
+            } else if state.client_size == state.host_size {
+                state.presentation = Some(DesktopPresentation::Native);
+                state.status = AccessStatus::Granted;
+            } else if state.resolution_policy == Some(ResolutionSelection::Scale) {
+                // The first choice keeps the physical mode fixed even if it is
+                // later changed manually in Windows display settings.
+                state.presentation = Some(DesktopPresentation::Scale);
+                state.status = AccessStatus::Granted;
+            } else if state.resolution_policy == Some(ResolutionSelection::MatchDisplay)
+                && state.presentation == Some(DesktopPresentation::Scale)
+            {
+                // A dynamically requested physical mode may only approximate
+                // an arbitrary window size. Keep the exact RDP canvas and
+                // letterbox the nearest physical mode when necessary.
+                state.status = AccessStatus::Granted;
+            } else {
+                state.presentation = None;
+                state.status = AccessStatus::ResolutionRequired;
+            }
+        }
+
+        if state.snapshot() != old_snapshot {
+            self.publish(&state);
+        }
     }
 
     pub fn show_login(&self) {
@@ -135,6 +315,8 @@ impl AccessGate {
         state.password.clear();
         state.status = AccessStatus::Checking;
         state.authenticated = false;
+        state.resolution_policy = None;
+        state.presentation = None;
         let generation = state.generation;
         self.publish(&state);
         generation
@@ -149,19 +331,35 @@ impl AccessGate {
         match result {
             Ok(true) => {
                 state.username = username.trim().to_string();
-                state.status = AccessStatus::Granted;
                 state.authenticated = true;
+                if !state.host_available {
+                    state.status = AccessStatus::WaitingForDesktop;
+                    state.presentation = None;
+                } else if state.client_size.is_some() && state.client_size == state.host_size {
+                    state.status = AccessStatus::Granted;
+                    state.resolution_policy = Some(ResolutionSelection::Scale);
+                    state.presentation = Some(DesktopPresentation::Native);
+                } else {
+                    state.status = AccessStatus::ResolutionRequired;
+                    state.resolution_policy = None;
+                    state.presentation = None;
+                    state.resolution_selection = ResolutionSelection::Scale;
+                }
                 tracing::info!(user = %state.username, "SunRDP access granted");
             }
             Ok(false) => {
                 state.status = AccessStatus::Rejected;
                 state.authenticated = false;
+                state.resolution_policy = None;
+                state.presentation = None;
                 state.focus = AccessField::Password;
                 tracing::warn!(user = %state.username, "SunRDP access rejected");
             }
             Err(error) => {
                 state.status = AccessStatus::BackendError;
                 state.authenticated = false;
+                state.resolution_policy = None;
+                state.presentation = None;
                 state.focus = AccessField::Password;
                 tracing::error!(?error, "SunRDP local account validation failed");
             }
@@ -169,76 +367,126 @@ impl AccessGate {
         self.publish(&state);
     }
 
-    pub fn handle_keyboard(&self, event: &KeyboardEvent) {
-        let submission = {
+    pub fn handle_keyboard(&self, event: &KeyboardEvent) -> Option<AccessAction> {
+        let mut submission = None;
+        let action = {
             let mut state = self.lock_state();
-            if state.authenticated || state.status == AccessStatus::Checking {
-                return;
+            if state.snapshot().is_desktop_ready() || state.status == AccessStatus::Checking {
+                return None;
             }
 
-            let mut changed = false;
-            let mut submit = false;
-            match event {
-                KeyboardEvent::Pressed { code: 42 | 54, .. } => state.shift = true,
-                KeyboardEvent::Released { code: 42 | 54, .. } => state.shift = false,
-                KeyboardEvent::Pressed { code: 58, .. } => {
-                    state.caps_lock = !state.caps_lock;
+            if state.authenticated {
+                if !state.host_available {
+                    return None;
                 }
-                KeyboardEvent::Pressed { code: 14, .. } => {
-                    active_field_mut(&mut state).pop();
-                    changed = true;
-                }
-                KeyboardEvent::Pressed { code: 15, .. } => {
-                    state.focus = match state.focus {
-                        AccessField::Username => AccessField::Password,
-                        AccessField::Password => AccessField::Username,
-                    };
-                    changed = true;
-                }
-                KeyboardEvent::Pressed { code: 28, .. } => submit = true,
-                KeyboardEvent::Pressed { code, extended } if !extended => {
-                    if let Some(character) =
-                        scan_code_character(*code, state.shift, state.caps_lock)
-                    {
-                        changed = push_character(&mut state, character);
-                    }
-                }
-                KeyboardEvent::Pressed { .. } => {}
-                KeyboardEvent::UnicodePressed(code) => {
-                    if let Some(character) = char::from_u32(u32::from(*code))
-                        && !character.is_control()
-                    {
-                        changed = push_character(&mut state, character);
-                    }
-                }
-                KeyboardEvent::Released { .. }
-                | KeyboardEvent::UnicodeReleased(_)
-                | KeyboardEvent::Synchronize(_) => {}
-            }
-
-            if changed {
-                state.status = AccessStatus::Ready;
-                self.publish(&state);
-            }
-
-            if submit {
-                if state.username.trim().is_empty() || state.password.is_empty() {
-                    state.status = AccessStatus::MissingCredentials;
+                let action = handle_resolution_keyboard(&mut state, event);
+                if action.is_some() || !matches!(event, KeyboardEvent::Released { .. }) {
                     self.publish(&state);
-                    None
-                } else {
-                    state.status = AccessStatus::Checking;
-                    let username = state.username.trim().to_string();
-                    let password = Zeroizing::new(std::mem::take(&mut state.password));
-                    let generation = state.generation;
-                    self.publish(&state);
-                    Some((generation, username, password))
                 }
+                action
             } else {
+                let (changed, submit) = handle_login_keyboard(&mut state, event);
+                if changed {
+                    state.status = AccessStatus::Ready;
+                }
+                if submit {
+                    submission = prepare_submission(&mut state);
+                }
+                if changed || submit {
+                    self.publish(&state);
+                }
                 None
             }
         };
+        self.spawn_validation(submission);
+        action
+    }
 
+    pub fn handle_mouse(&self, event: &MouseEvent) -> Option<AccessAction> {
+        let mut submission = None;
+        let action = {
+            let mut state = self.lock_state();
+            match event {
+                MouseEvent::Move { x, y } => {
+                    state.pointer = (*x, *y);
+                    return None;
+                }
+                MouseEvent::Button {
+                    x,
+                    y,
+                    button: MouseButton::Left,
+                    pressed: true,
+                } => state.pointer = (*x, *y),
+                _ => return None,
+            }
+
+            if state.snapshot().is_desktop_ready() || state.status == AccessStatus::Checking {
+                return None;
+            }
+            let size = state.client_size?;
+            let layout = UiLayout::new(size, state.authenticated);
+            let (x, y) = state.pointer;
+            if state.authenticated {
+                if !state.host_available {
+                    return None;
+                }
+                if layout.primary.contains(x, y) {
+                    state.resolution_selection = ResolutionSelection::Scale;
+                    state.status = AccessStatus::ResolutionRequired;
+                    self.publish(&state);
+                    None
+                } else if layout.secondary.contains(x, y) {
+                    state.resolution_selection = ResolutionSelection::MatchDisplay;
+                    state.status = AccessStatus::ResolutionRequired;
+                    self.publish(&state);
+                    None
+                } else if layout.submit.contains(x, y) {
+                    let action = apply_resolution_choice(&mut state);
+                    self.publish(&state);
+                    action
+                } else {
+                    None
+                }
+            } else {
+                if layout.primary.contains(x, y) {
+                    state.focus = AccessField::Username;
+                    state.status = AccessStatus::Ready;
+                    self.publish(&state);
+                } else if layout.secondary.contains(x, y) {
+                    state.focus = AccessField::Password;
+                    state.status = AccessStatus::Ready;
+                    self.publish(&state);
+                } else if layout.submit.contains(x, y) {
+                    submission = prepare_submission(&mut state);
+                    self.publish(&state);
+                }
+                None
+            }
+        };
+        self.spawn_validation(submission);
+        action
+    }
+
+    pub fn resolution_change_failed(&self, error: &anyhow::Error) {
+        let mut state = self.lock_state();
+        tracing::warn!(
+            ?error,
+            "unable to change the physical display resolution; continuing with proportional scaling"
+        );
+        if state.authenticated && state.resolution_policy == Some(ResolutionSelection::MatchDisplay)
+        {
+            state.presentation = Some(DesktopPresentation::Scale);
+            state.status = AccessStatus::Granted;
+            self.publish(&state);
+        }
+    }
+
+    pub fn render_frame(&self, size: DesktopSize) -> CapturedFrame {
+        let snapshot = self.inner.sender.borrow().clone();
+        render_access_frame(size, &snapshot)
+    }
+
+    fn spawn_validation(&self, submission: Option<ValidationSubmission>) {
         let Some((generation, username, password)) = submission else {
             return;
         };
@@ -256,11 +504,6 @@ impl AccessGate {
         }
     }
 
-    pub fn render_frame(&self, size: DesktopSize) -> CapturedFrame {
-        let snapshot = self.inner.sender.borrow().clone();
-        render_access_frame(size, &snapshot)
-    }
-
     fn lock_state(&self) -> std::sync::MutexGuard<'_, AccessState> {
         self.inner
             .state
@@ -271,6 +514,98 @@ impl AccessGate {
     fn publish(&self, state: &AccessState) {
         self.inner.sender.send_replace(state.snapshot());
     }
+}
+
+type ValidationSubmission = (u64, String, Zeroizing<String>);
+
+fn handle_login_keyboard(state: &mut AccessState, event: &KeyboardEvent) -> (bool, bool) {
+    let mut changed = false;
+    let mut submit = false;
+    match event {
+        KeyboardEvent::Pressed { code: 42 | 54, .. } => state.shift = true,
+        KeyboardEvent::Released { code: 42 | 54, .. } => state.shift = false,
+        KeyboardEvent::Pressed { code: 58, .. } => state.caps_lock = !state.caps_lock,
+        KeyboardEvent::Pressed { code: 14, .. } => {
+            active_field_mut(state).pop();
+            changed = true;
+        }
+        KeyboardEvent::Pressed { code: 15, .. } => {
+            state.focus = match state.focus {
+                AccessField::Username => AccessField::Password,
+                AccessField::Password => AccessField::Username,
+            };
+            changed = true;
+        }
+        KeyboardEvent::Pressed { code: 28, .. } => submit = true,
+        KeyboardEvent::Pressed { code, extended } if !extended => {
+            if let Some(character) = scan_code_character(*code, state.shift, state.caps_lock) {
+                changed = push_character(state, character);
+            }
+        }
+        KeyboardEvent::UnicodePressed(code) => {
+            if let Some(character) = char::from_u32(u32::from(*code))
+                && !character.is_control()
+            {
+                changed = push_character(state, character);
+            }
+        }
+        _ => {}
+    }
+    (changed, submit)
+}
+
+fn handle_resolution_keyboard(
+    state: &mut AccessState,
+    event: &KeyboardEvent,
+) -> Option<AccessAction> {
+    match event {
+        KeyboardEvent::Pressed {
+            code: 15 | 75 | 77 | 72 | 80,
+            ..
+        } => {
+            state.resolution_selection = match state.resolution_selection {
+                ResolutionSelection::Scale => ResolutionSelection::MatchDisplay,
+                ResolutionSelection::MatchDisplay => ResolutionSelection::Scale,
+            };
+            state.status = AccessStatus::ResolutionRequired;
+            None
+        }
+        KeyboardEvent::Pressed { code: 28, .. } => apply_resolution_choice(state),
+        _ => None,
+    }
+}
+
+fn apply_resolution_choice(state: &mut AccessState) -> Option<AccessAction> {
+    match state.resolution_selection {
+        ResolutionSelection::Scale => {
+            state.resolution_policy = Some(ResolutionSelection::Scale);
+            state.presentation = Some(DesktopPresentation::Scale);
+            state.status = AccessStatus::Granted;
+            None
+        }
+        ResolutionSelection::MatchDisplay => {
+            let target = state.client_size?;
+            state.resolution_policy = Some(ResolutionSelection::MatchDisplay);
+            // A physical display can expose only a finite set of modes, while
+            // clients (especially phones in portrait orientation) request
+            // arbitrary canvas sizes. Start proportional presentation now and
+            // let an exact capture size upgrade it to Native asynchronously.
+            state.presentation = Some(DesktopPresentation::Scale);
+            state.status = AccessStatus::Granted;
+            Some(AccessAction::ChangeDisplaySize(target))
+        }
+    }
+}
+
+fn prepare_submission(state: &mut AccessState) -> Option<ValidationSubmission> {
+    if state.username.trim().is_empty() || state.password.is_empty() {
+        state.status = AccessStatus::MissingCredentials;
+        return None;
+    }
+    state.status = AccessStatus::Checking;
+    let username = state.username.trim().to_string();
+    let password = Zeroizing::new(std::mem::take(&mut state.password));
+    Some((state.generation, username, password))
 }
 
 fn active_field_mut(state: &mut AccessState) -> &mut String {
@@ -366,237 +701,776 @@ fn scan_code_character(code: u8, shift: bool, caps_lock: bool) -> Option<char> {
     Some(if shift { pair.1 } else { pair.0 })
 }
 
-fn render_access_frame(size: DesktopSize, snapshot: &AccessSnapshot) -> CapturedFrame {
-    let width = usize::from(size.width);
-    let height = usize::from(size.height);
-    let mut rgba = vec![0; width * height * 4];
-    fill(&mut rgba, size, [8, 15, 28, 255]);
+#[derive(Clone, Copy, Debug, Default)]
+struct Rect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
 
-    let scale = if width >= 900 { 3 } else { 2 };
-    let card_width = width.saturating_sub(40).min(760);
-    let card_height = (360 * scale / 2).min(height.saturating_sub(40));
-    let card_x = (width.saturating_sub(card_width)) / 2;
-    let card_y = (height.saturating_sub(card_height)) / 2;
-    draw_rect(
-        &mut rgba,
-        size,
-        card_x,
-        card_y,
-        card_width,
-        card_height,
-        [20, 31, 50, 255],
-    );
-    draw_rect(
-        &mut rgba,
-        size,
-        card_x,
-        card_y,
-        card_width,
-        6,
-        [255, 177, 33, 255],
-    );
+impl Rect {
+    fn contains(self, x: u16, y: u16) -> bool {
+        let x = f32::from(x);
+        let y = f32::from(y);
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
+}
 
-    let content_x = card_x + 36;
-    let mut y = card_y + 34;
-    draw_text(
-        &mut rgba,
-        size,
-        content_x,
-        y,
-        "SUN REMOTE DESKTOP",
-        scale,
-        [245, 248, 255, 255],
-    );
-    y += 14 * scale;
-    draw_text(
-        &mut rgba,
-        size,
-        content_x,
-        y,
-        "SUNRDP LOCAL ACCOUNT ACCESS",
-        scale.saturating_sub(1).max(1),
-        [151, 166, 190, 255],
-    );
+struct UiLayout {
+    card: Rect,
+    content: Rect,
+    primary: Rect,
+    secondary: Rect,
+    submit: Rect,
+    compact: bool,
+}
 
-    y += 22 * scale;
-    draw_field(
-        &mut rgba,
-        size,
-        content_x,
-        y,
-        card_width.saturating_sub(72),
-        "USERNAME",
-        &snapshot.username,
-        snapshot.focus == AccessField::Username,
-        scale,
-    );
-    y += 48 * scale;
-    let masked = "*".repeat(snapshot.password_length.min(48));
-    draw_field(
-        &mut rgba,
-        size,
-        content_x,
-        y,
-        card_width.saturating_sub(72),
-        "PASSWORD",
-        &masked,
-        snapshot.focus == AccessField::Password,
-        scale,
-    );
-
-    y += 52 * scale;
-    let (status, color) = match snapshot.status {
-        AccessStatus::Ready => ("TAB: SWITCH FIELD    ENTER: CONNECT", [151, 166, 190, 255]),
-        AccessStatus::MissingCredentials => {
-            ("ENTER BOTH USERNAME AND PASSWORD", [255, 193, 92, 255])
+impl UiLayout {
+    fn new(size: DesktopSize, resolution: bool) -> Self {
+        let width = f32::from(size.width);
+        let height = f32::from(size.height);
+        let compact = height < 620.0 || width < 760.0;
+        let margin = if compact { 16.0 } else { 28.0 };
+        let desired_height: f32 = if resolution { 610.0 } else { 620.0 };
+        let desired_width: f32 = if resolution { 720.0 } else { 610.0 };
+        let card = Rect {
+            width: desired_width.min(width - margin * 2.0).max(320.0),
+            height: desired_height.min(height - margin * 2.0).max(360.0),
+            x: 0.0,
+            y: 0.0,
+        };
+        let card = Rect {
+            x: (width - card.width) / 2.0,
+            y: (height - card.height) / 2.0,
+            ..card
+        };
+        let padding = if compact { 28.0 } else { 46.0 };
+        let content = Rect {
+            x: card.x + padding,
+            y: card.y + padding,
+            width: card.width - padding * 2.0,
+            height: card.height - padding * 2.0,
+        };
+        let field_height = if compact { 50.0 } else { 58.0 };
+        let (primary_y, secondary_y, submit_y, item_height) = if resolution {
+            let first = content.y + if compact { 134.0 } else { 164.0 };
+            let option_height = if compact { 72.0 } else { 86.0 };
+            (
+                first,
+                first + option_height + 12.0,
+                content.y + content.height - field_height,
+                option_height,
+            )
+        } else {
+            let first = content.y + if compact { 132.0 } else { 166.0 };
+            (
+                first,
+                first + field_height + 42.0,
+                content.y + content.height - field_height - 34.0,
+                field_height,
+            )
+        };
+        Self {
+            card,
+            content,
+            primary: Rect {
+                x: content.x,
+                y: primary_y,
+                width: content.width,
+                height: item_height,
+            },
+            secondary: Rect {
+                x: content.x,
+                y: secondary_y,
+                width: content.width,
+                height: item_height,
+            },
+            submit: Rect {
+                x: content.x,
+                y: submit_y,
+                width: content.width,
+                height: field_height,
+            },
+            compact,
         }
-        AccessStatus::Checking => ("CHECKING LOCAL WINDOWS ACCOUNT...", [92, 194, 255, 255]),
-        AccessStatus::Rejected => (
-            "ACCESS DENIED - CHECK ACCOUNT OR PERMISSION",
-            [255, 105, 105, 255],
-        ),
-        AccessStatus::BackendError => (
-            "AUTHENTICATION SERVICE ERROR - TRY AGAIN",
-            [255, 105, 105, 255],
-        ),
-        AccessStatus::Granted => ("ACCESS GRANTED", [104, 222, 143, 255]),
-    };
-    draw_text(
-        &mut rgba,
-        size,
-        content_x,
-        y,
-        status,
-        scale.saturating_sub(1).max(1),
-        color,
-    );
+    }
+}
 
+fn render_access_frame(size: DesktopSize, snapshot: &AccessSnapshot) -> CapturedFrame {
+    let mut canvas = Canvas::new(size);
+    canvas.background();
+    let waiting = snapshot.authenticated && !snapshot.host_available;
+    let resolution =
+        snapshot.authenticated && snapshot.host_available && !snapshot.is_desktop_ready();
+    let layout = UiLayout::new(size, resolution);
+    canvas.rounded_rect(layout.card, 22.0, [16, 27, 46, 245]);
+    canvas.rounded_outline(layout.card, 22.0, 1.0, [74, 96, 129, 150]);
+    canvas.brand(layout.content.x, layout.content.y, layout.compact);
+    if waiting {
+        render_waiting(&mut canvas, layout, snapshot);
+    } else if resolution {
+        render_resolution(&mut canvas, layout, snapshot);
+    } else {
+        render_login(&mut canvas, layout, snapshot);
+    }
     CapturedFrame {
         width: size.width,
         height: size.height,
-        rgba,
+        rgba: canvas.rgba,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_field(
-    rgba: &mut [u8],
-    size: DesktopSize,
-    x: usize,
-    y: usize,
-    width: usize,
-    label: &str,
-    value: &str,
-    focused: bool,
-    scale: usize,
-) {
-    let border = if focused {
-        [255, 177, 33, 255]
-    } else {
-        [70, 86, 112, 255]
+fn render_waiting(canvas: &mut Canvas, layout: UiLayout, snapshot: &AccessSnapshot) {
+    let title_size = if layout.compact { 25.0 } else { 32.0 };
+    let title_y = layout.content.y + if layout.compact { 52.0 } else { 76.0 };
+    canvas.text(
+        layout.content.x,
+        title_y,
+        "Waiting for the physical console",
+        title_size,
+        [246, 249, 255, 255],
+        layout.content.width,
+    );
+    let client = snapshot.client_size.unwrap_or(DesktopSize {
+        width: 0,
+        height: 0,
+    });
+    canvas.text(
+        layout.content.x,
+        title_y + title_size + 10.0,
+        &format!("Remote client  {} × {}", client.width, client.height),
+        if layout.compact { 13.0 } else { 15.0 },
+        [153, 169, 194, 255],
+        layout.content.width,
+    );
+    let panel = Rect {
+        x: layout.content.x,
+        y: title_y + title_size + if layout.compact { 68.0 } else { 92.0 },
+        width: layout.content.width,
+        height: if layout.compact { 112.0 } else { 138.0 },
     };
-    draw_rect(rgba, size, x, y, width, 40 * scale, border);
-    draw_rect(
-        rgba,
-        size,
-        x + 2,
-        y + 2,
-        width.saturating_sub(4),
-        40 * scale - 4,
-        [12, 21, 36, 255],
+    canvas.rounded_rect(panel, 14.0, [10, 20, 36, 255]);
+    canvas.rounded_outline(panel, 14.0, 1.0, [67, 85, 112, 220]);
+    canvas.circle(panel.x + 32.0, panel.y + 35.0, 9.0, [91, 194, 255, 255]);
+    canvas.text(
+        panel.x + 54.0,
+        panel.y + 20.0,
+        "SunRDP is ready and your access is verified",
+        if layout.compact { 15.0 } else { 17.0 },
+        [239, 244, 252, 255],
+        panel.width - 74.0,
     );
-    draw_text(
-        rgba,
-        size,
-        x + 12,
-        y + 6,
-        label,
-        scale.saturating_sub(1).max(1),
-        [151, 166, 190, 255],
+    canvas.text(
+        panel.x + 54.0,
+        panel.y + if layout.compact { 51.0 } else { 58.0 },
+        "Physical console capture is not available yet.",
+        if layout.compact { 12.5 } else { 14.0 },
+        [139, 156, 182, 255],
+        panel.width - 74.0,
     );
-    draw_text(
-        rgba,
-        size,
-        x + 12,
-        y + 17 * scale,
-        value,
-        scale,
-        [245, 248, 255, 255],
+    canvas.text(
+        panel.x + 54.0,
+        panel.y + if layout.compact { 75.0 } else { 84.0 },
+        "No desktop frames or input are being forwarded.",
+        if layout.compact { 12.5 } else { 14.0 },
+        [139, 156, 182, 255],
+        panel.width - 74.0,
+    );
+    canvas.text(
+        layout.content.x,
+        layout.content.y + layout.content.height - 22.0,
+        "This page will continue automatically when the physical console becomes available.",
+        13.0,
+        [126, 143, 169, 255],
+        layout.content.width,
     );
 }
 
-fn fill(rgba: &mut [u8], size: DesktopSize, color: [u8; 4]) {
-    draw_rect(
-        rgba,
-        size,
-        0,
-        0,
-        usize::from(size.width),
-        usize::from(size.height),
+fn render_login(canvas: &mut Canvas, layout: UiLayout, snapshot: &AccessSnapshot) {
+    let title_size = if layout.compact { 27.0 } else { 34.0 };
+    let title_y = layout.content.y + if layout.compact { 42.0 } else { 52.0 };
+    canvas.text(
+        layout.content.x,
+        title_y,
+        "Connect securely",
+        title_size,
+        [246, 249, 255, 255],
+        layout.content.width,
+    );
+    canvas.text(
+        layout.content.x,
+        title_y + title_size + 6.0,
+        "Sign in with an allowed local Windows account",
+        if layout.compact { 13.0 } else { 15.0 },
+        [153, 169, 194, 255],
+        layout.content.width,
+    );
+
+    canvas.label(layout.primary.x, layout.primary.y - 23.0, "WINDOWS ACCOUNT");
+    canvas.field(layout.primary, snapshot.focus == AccessField::Username);
+    let username = if snapshot.username.is_empty() {
+        "Computer\\username"
+    } else {
+        &snapshot.username
+    };
+    let username_color = if snapshot.username.is_empty() {
+        [113, 130, 155, 255]
+    } else {
+        [239, 244, 252, 255]
+    };
+    canvas.text(
+        layout.primary.x + 17.0,
+        layout.primary.y + 13.0,
+        username,
+        if layout.compact { 17.0 } else { 19.0 },
+        username_color,
+        layout.primary.width - 34.0,
+    );
+
+    canvas.label(layout.secondary.x, layout.secondary.y - 23.0, "PASSWORD");
+    canvas.field(layout.secondary, snapshot.focus == AccessField::Password);
+    let masked = "•".repeat(snapshot.password_length.min(48));
+    let password = if masked.is_empty() {
+        "Enter your password"
+    } else {
+        &masked
+    };
+    let password_color = if masked.is_empty() {
+        [113, 130, 155, 255]
+    } else {
+        [239, 244, 252, 255]
+    };
+    canvas.text(
+        layout.secondary.x + 17.0,
+        layout.secondary.y + 13.0,
+        password,
+        if layout.compact { 17.0 } else { 19.0 },
+        password_color,
+        layout.secondary.width - 34.0,
+    );
+
+    canvas.button(layout.submit, "Connect");
+    let (message, color) = match snapshot.status {
+        AccessStatus::MissingCredentials => {
+            ("Enter both your account and password", [255, 190, 92, 255])
+        }
+        AccessStatus::Checking => ("Checking your local Windows account…", [91, 194, 255, 255]),
+        AccessStatus::Rejected => (
+            "Access denied. Check the account or allow-list.",
+            [255, 114, 122, 255],
+        ),
+        AccessStatus::BackendError => (
+            "Authentication service unavailable. Try again.",
+            [255, 114, 122, 255],
+        ),
+        _ => (
+            "Tab switches fields  •  Enter connects",
+            [126, 143, 169, 255],
+        ),
+    };
+    canvas.text(
+        layout.content.x,
+        layout.submit.y + layout.submit.height + 12.0,
+        message,
+        13.0,
         color,
+        layout.content.width,
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_rect(
-    rgba: &mut [u8],
+fn render_resolution(canvas: &mut Canvas, layout: UiLayout, snapshot: &AccessSnapshot) {
+    let title_size = if layout.compact { 25.0 } else { 32.0 };
+    let title_y = layout.content.y + if layout.compact { 40.0 } else { 52.0 };
+    canvas.text(
+        layout.content.x,
+        title_y,
+        "Choose the display fit",
+        title_size,
+        [246, 249, 255, 255],
+        layout.content.width,
+    );
+    let client = snapshot.client_size.unwrap_or(DesktopSize {
+        width: 0,
+        height: 0,
+    });
+    let host = snapshot.host_size.unwrap_or(DesktopSize {
+        width: 0,
+        height: 0,
+    });
+    let dimensions = format!(
+        "Remote client  {} × {}     Shared screen  {} × {}",
+        client.width, client.height, host.width, host.height
+    );
+    canvas.text(
+        layout.content.x,
+        title_y + title_size + 7.0,
+        &dimensions,
+        if layout.compact { 12.5 } else { 14.0 },
+        [153, 169, 194, 255],
+        layout.content.width,
+    );
+
+    canvas.option_card(
+        layout.primary,
+        snapshot.resolution_selection == ResolutionSelection::Scale,
+        "Scale to this window",
+        "Keep proportions and add bars when needed",
+        true,
+    );
+    canvas.option_card(
+        layout.secondary,
+        snapshot.resolution_selection == ResolutionSelection::MatchDisplay,
+        "Match the physical display",
+        &format!(
+            "Change the local screen to {} × {}",
+            client.width, client.height
+        ),
+        false,
+    );
+
+    canvas.button(layout.submit, "Continue");
+    let (message, color) = (
+        "Tab or arrow keys switch options  •  Enter continues",
+        [126, 143, 169, 255],
+    );
+    canvas.text(
+        layout.content.x,
+        layout.submit.y + layout.submit.height + 12.0,
+        message,
+        13.0,
+        color,
+        layout.content.width,
+    );
+}
+
+struct Canvas {
     size: DesktopSize,
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    color: [u8; 4],
-) {
-    let stride = usize::from(size.width) * 4;
-    let max_x = (x + width).min(usize::from(size.width));
-    let max_y = (y + height).min(usize::from(size.height));
-    for pixel_y in y.min(max_y)..max_y {
-        for pixel_x in x.min(max_x)..max_x {
-            let offset = pixel_y * stride + pixel_x * 4;
-            rgba[offset..offset + 4].copy_from_slice(&color);
+    rgba: Vec<u8>,
+}
+
+impl Canvas {
+    fn new(size: DesktopSize) -> Self {
+        Self {
+            size,
+            rgba: vec![0; usize::from(size.width) * usize::from(size.height) * 4],
         }
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn draw_text(
-    rgba: &mut [u8],
-    size: DesktopSize,
-    x: usize,
-    y: usize,
-    text: &str,
-    scale: usize,
-    color: [u8; 4],
-) {
-    let mut cursor_x = x;
-    for character in text.chars() {
-        if let Some(glyph) = BASIC_FONTS.get(character) {
-            for (glyph_y, row) in glyph.iter().enumerate() {
-                for glyph_x in 0..8 {
-                    if row & (1 << glyph_x) != 0 {
-                        draw_rect(
-                            rgba,
-                            size,
-                            cursor_x + glyph_x * scale,
-                            y + glyph_y * scale,
-                            scale,
-                            scale,
-                            color,
-                        );
+    fn background(&mut self) {
+        let width = usize::from(self.size.width);
+        let height = usize::from(self.size.height);
+        for y in 0..height {
+            let t = y as f32 / height.max(1) as f32;
+            let color = [
+                (7.0 + 5.0 * t) as u8,
+                (14.0 + 10.0 * t) as u8,
+                (29.0 + 16.0 * t) as u8,
+                255,
+            ];
+            for x in 0..width {
+                let offset = (y * width + x) * 4;
+                self.rgba[offset..offset + 4].copy_from_slice(&color);
+            }
+        }
+        let radius =
+            (f32::from(self.size.width).min(f32::from(self.size.height)) * 0.38).max(120.0);
+        self.circle(
+            f32::from(self.size.width) * 0.13,
+            f32::from(self.size.height) * 0.18,
+            radius,
+            [255, 162, 48, 18],
+        );
+        self.circle(
+            f32::from(self.size.width) * 0.88,
+            f32::from(self.size.height) * 0.88,
+            radius * 0.8,
+            [44, 135, 255, 15],
+        );
+    }
+
+    fn brand(&mut self, x: f32, y: f32, compact: bool) {
+        let size = if compact { 25.0 } else { 29.0 };
+        self.circle(
+            x + size * 0.48,
+            y + size * 0.48,
+            size * 0.46,
+            [255, 174, 54, 255],
+        );
+        self.circle(
+            x + size * 0.48,
+            y + size * 0.48,
+            size * 0.20,
+            [255, 223, 134, 255],
+        );
+        self.text(
+            x + size + 10.0,
+            y - 1.0,
+            "SunRemoteDesktop",
+            if compact { 18.0 } else { 20.0 },
+            [240, 245, 253, 255],
+            360.0,
+        );
+        self.text(
+            x + size + 10.0,
+            y + if compact { 19.0 } else { 22.0 },
+            "SunRDP protected access",
+            11.5,
+            [126, 143, 169, 255],
+            360.0,
+        );
+    }
+
+    fn label(&mut self, x: f32, y: f32, text: &str) {
+        self.text(x, y, text, 11.5, [153, 169, 194, 255], 400.0);
+    }
+
+    fn field(&mut self, rect: Rect, focused: bool) {
+        if focused {
+            self.rounded_rect(
+                Rect {
+                    x: rect.x - 3.0,
+                    y: rect.y - 3.0,
+                    width: rect.width + 6.0,
+                    height: rect.height + 6.0,
+                },
+                12.0,
+                [255, 174, 54, 42],
+            );
+        }
+        self.rounded_rect(rect, 10.0, [10, 20, 36, 255]);
+        self.rounded_outline(
+            rect,
+            10.0,
+            if focused { 2.0 } else { 1.0 },
+            if focused {
+                [255, 174, 54, 255]
+            } else {
+                [67, 85, 112, 220]
+            },
+        );
+    }
+
+    fn option_card(
+        &mut self,
+        rect: Rect,
+        selected: bool,
+        title: &str,
+        detail: &str,
+        recommended: bool,
+    ) {
+        if selected {
+            self.rounded_rect(
+                Rect {
+                    x: rect.x - 3.0,
+                    y: rect.y - 3.0,
+                    width: rect.width + 6.0,
+                    height: rect.height + 6.0,
+                },
+                14.0,
+                [255, 174, 54, 35],
+            );
+        }
+        self.rounded_rect(
+            rect,
+            12.0,
+            if selected {
+                [35, 39, 48, 255]
+            } else {
+                [11, 22, 39, 255]
+            },
+        );
+        self.rounded_outline(
+            rect,
+            12.0,
+            if selected { 2.0 } else { 1.0 },
+            if selected {
+                [255, 174, 54, 255]
+            } else {
+                [67, 85, 112, 220]
+            },
+        );
+        self.circle(
+            rect.x + 24.0,
+            rect.y + rect.height / 2.0,
+            8.0,
+            if selected {
+                [255, 174, 54, 255]
+            } else {
+                [42, 57, 80, 255]
+            },
+        );
+        if selected {
+            self.circle(
+                rect.x + 24.0,
+                rect.y + rect.height / 2.0,
+                3.0,
+                [255, 244, 216, 255],
+            );
+        }
+        let title_y = rect.y + if rect.height < 80.0 { 13.0 } else { 16.0 };
+        self.text(
+            rect.x + 45.0,
+            title_y,
+            title,
+            17.0,
+            [240, 245, 253, 255],
+            rect.width - 65.0,
+        );
+        self.text(
+            rect.x + 45.0,
+            title_y + 25.0,
+            detail,
+            12.5,
+            [139, 156, 182, 255],
+            rect.width - 65.0,
+        );
+        if recommended && rect.width > 440.0 {
+            let badge = Rect {
+                x: rect.x + rect.width - 112.0,
+                y: rect.y + 14.0,
+                width: 94.0,
+                height: 24.0,
+            };
+            self.rounded_rect(badge, 12.0, [81, 57, 20, 255]);
+            self.text(
+                badge.x + 11.0,
+                badge.y + 5.0,
+                "RECOMMENDED",
+                9.5,
+                [255, 201, 103, 255],
+                badge.width - 20.0,
+            );
+        }
+    }
+
+    fn button(&mut self, rect: Rect, label: &str) {
+        self.rounded_rect(rect, 11.0, [255, 169, 42, 255]);
+        self.rounded_outline(rect, 11.0, 1.0, [255, 213, 126, 255]);
+        self.centered_text(rect, label, 17.0, [28, 23, 15, 255]);
+    }
+
+    fn centered_text(&mut self, rect: Rect, text: &str, px: f32, color: [u8; 4]) {
+        let width = measure_text(text, px);
+        let x = rect.x + ((rect.width - width).max(0.0) / 2.0);
+        let y = rect.y + ((rect.height - px).max(0.0) / 2.0) - 1.0;
+        self.text(x, y, text, px, color, rect.width);
+    }
+
+    fn text(&mut self, x: f32, y: f32, text: &str, px: f32, color: [u8; 4], max_width: f32) {
+        if let Some(font) = system_font() {
+            let baseline = y + font
+                .horizontal_line_metrics(px)
+                .map_or(px * 0.82, |metrics| metrics.ascent);
+            let mut cursor = x;
+            for character in text.chars() {
+                let metrics = font.metrics(character, px);
+                if cursor + metrics.advance_width > x + max_width {
+                    break;
+                }
+                let (metrics, bitmap) = font.rasterize(character, px);
+                let glyph_x = cursor + metrics.xmin as f32;
+                let glyph_y = baseline - metrics.height as f32 - metrics.ymin as f32;
+                for row in 0..metrics.height {
+                    for column in 0..metrics.width {
+                        let alpha = bitmap[row * metrics.width + column];
+                        if alpha != 0 {
+                            self.blend_pixel(
+                                (glyph_x + column as f32) as i32,
+                                (glyph_y + row as f32) as i32,
+                                color,
+                                alpha,
+                            );
+                        }
                     }
+                }
+                cursor += metrics.advance_width;
+            }
+        } else {
+            self.bitmap_text(
+                x as usize,
+                y as usize,
+                text,
+                (px / 8.0).round().max(1.0) as usize,
+                color,
+                (x + max_width) as usize,
+            );
+        }
+    }
+
+    fn rounded_rect(&mut self, rect: Rect, radius: f32, color: [u8; 4]) {
+        self.paint_round_rect(rect, radius, color, false, 0.0);
+    }
+
+    fn rounded_outline(&mut self, rect: Rect, radius: f32, thickness: f32, color: [u8; 4]) {
+        self.paint_round_rect(rect, radius, color, true, thickness);
+    }
+
+    fn paint_round_rect(
+        &mut self,
+        rect: Rect,
+        radius: f32,
+        color: [u8; 4],
+        outline: bool,
+        thickness: f32,
+    ) {
+        let min_x = rect.x.max(0.0) as i32;
+        let min_y = rect.y.max(0.0) as i32;
+        let max_x = (rect.x + rect.width).min(f32::from(self.size.width)).ceil() as i32;
+        let max_y = (rect.y + rect.height)
+            .min(f32::from(self.size.height))
+            .ceil() as i32;
+        for y in min_y..max_y {
+            for x in min_x..max_x {
+                if inside_rounded(rect, radius, x as f32 + 0.5, y as f32 + 0.5)
+                    && (!outline
+                        || !inside_rounded(
+                            Rect {
+                                x: rect.x + thickness,
+                                y: rect.y + thickness,
+                                width: rect.width - thickness * 2.0,
+                                height: rect.height - thickness * 2.0,
+                            },
+                            (radius - thickness).max(0.0),
+                            x as f32 + 0.5,
+                            y as f32 + 0.5,
+                        ))
+                {
+                    self.blend_pixel(x, y, color, 255);
                 }
             }
         }
-        cursor_x += 9 * scale;
-        if cursor_x >= usize::from(size.width) {
-            break;
+    }
+
+    fn circle(&mut self, center_x: f32, center_y: f32, radius: f32, color: [u8; 4]) {
+        let min_x = (center_x - radius).max(0.0) as i32;
+        let min_y = (center_y - radius).max(0.0) as i32;
+        let max_x = (center_x + radius).min(f32::from(self.size.width)).ceil() as i32;
+        let max_y = (center_y + radius).min(f32::from(self.size.height)).ceil() as i32;
+        let radius_squared = radius * radius;
+        for y in min_y..max_y {
+            for x in min_x..max_x {
+                let dx = x as f32 + 0.5 - center_x;
+                let dy = y as f32 + 0.5 - center_y;
+                if dx * dx + dy * dy <= radius_squared {
+                    self.blend_pixel(x, y, color, 255);
+                }
+            }
         }
+    }
+
+    fn blend_pixel(&mut self, x: i32, y: i32, color: [u8; 4], coverage: u8) {
+        if x < 0 || y < 0 || x >= i32::from(self.size.width) || y >= i32::from(self.size.height) {
+            return;
+        }
+        let offset = (y as usize * usize::from(self.size.width) + x as usize) * 4;
+        let alpha = u16::from(color[3]) * u16::from(coverage) / 255;
+        let inverse = 255 - alpha;
+        for (channel, source) in color.iter().copied().enumerate().take(3) {
+            self.rgba[offset + channel] = ((u16::from(source) * alpha
+                + u16::from(self.rgba[offset + channel]) * inverse)
+                / 255) as u8;
+        }
+        self.rgba[offset + 3] = 255;
+    }
+
+    fn bitmap_text(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        scale: usize,
+        color: [u8; 4],
+        max_x: usize,
+    ) {
+        let mut cursor_x = x;
+        for character in text.chars() {
+            if let Some(glyph) = BASIC_FONTS.get(character) {
+                for (glyph_y, row) in glyph.iter().enumerate() {
+                    for glyph_x in 0..8 {
+                        if row & (1 << glyph_x) != 0 {
+                            let rect = Rect {
+                                x: (cursor_x + glyph_x * scale) as f32,
+                                y: (y + glyph_y * scale) as f32,
+                                width: scale as f32,
+                                height: scale as f32,
+                            };
+                            self.rounded_rect(rect, 0.0, color);
+                        }
+                    }
+                }
+            }
+            cursor_x += 9 * scale;
+            if cursor_x >= max_x {
+                break;
+            }
+        }
+    }
+}
+
+fn inside_rounded(rect: Rect, radius: f32, x: f32, y: f32) -> bool {
+    if rect.width <= 0.0
+        || rect.height <= 0.0
+        || x < rect.x
+        || y < rect.y
+        || x >= rect.x + rect.width
+        || y >= rect.y + rect.height
+    {
+        return false;
+    }
+    let radius = radius.min(rect.width / 2.0).min(rect.height / 2.0);
+    let nearest_x = x.clamp(rect.x + radius, rect.x + rect.width - radius);
+    let nearest_y = y.clamp(rect.y + radius, rect.y + rect.height - radius);
+    let dx = x - nearest_x;
+    let dy = y - nearest_y;
+    dx * dx + dy * dy <= radius * radius
+}
+
+fn system_font() -> Option<&'static Font> {
+    static FONT: OnceLock<Option<Font>> = OnceLock::new();
+    FONT.get_or_init(|| {
+        let windows = std::env::var_os("WINDIR").map(PathBuf::from)?;
+        ["segoeui.ttf", "arial.ttf"]
+            .into_iter()
+            .find_map(|name| std::fs::read(windows.join("Fonts").join(name)).ok())
+            .and_then(|bytes| Font::from_bytes(bytes, FontSettings::default()).ok())
+    })
+    .as_ref()
+}
+
+fn measure_text(text: &str, px: f32) -> f32 {
+    if let Some(font) = system_font() {
+        text.chars()
+            .map(|character| font.metrics(character, px).advance_width)
+            .sum()
+    } else {
+        text.chars().count() as f32 * 9.0 * (px / 8.0).round().max(1.0)
+    }
+}
+
+impl PartialEq for AccessSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.username == other.username
+            && self.password_length == other.password_length
+            && self.focus == other.focus
+            && self.status == other.status
+            && self.authenticated == other.authenticated
+            && self.client_size == other.client_size
+            && self.host_size == other.host_size
+            && self.host_available == other.host_available
+            && self.resolution_selection == other.resolution_selection
+            && self.resolution_policy == other.resolution_policy
+            && self.presentation == other.presentation
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn size(width: u16, height: u16) -> DesktopSize {
+        DesktopSize { width, height }
+    }
 
     #[test]
     fn scan_code_mapping_handles_letters_and_symbols() {
@@ -608,15 +1482,153 @@ mod tests {
     }
 
     #[test]
-    fn access_frame_matches_the_desktop_size() {
+    fn access_frame_matches_the_client_size() {
         let gate = AccessGate::new(PathBuf::from("unused.toml"));
-        let size = DesktopSize {
-            width: 640,
-            height: 480,
-        };
-        let frame = gate.render_frame(size);
-        assert_eq!(frame.width, size.width);
-        assert_eq!(frame.height, size.height);
+        let client = size(640, 480);
+        gate.set_display_sizes(client, size(2560, 1600));
+        let frame = gate.render_frame(client);
+        assert_eq!((frame.width, frame.height), (client.width, client.height));
         assert_eq!(frame.rgba.len(), 640 * 480 * 4);
+    }
+
+    #[test]
+    fn mismatched_displays_stay_gated_until_scaling_is_selected() {
+        let gate = AccessGate::new(PathBuf::from("unused.toml"));
+        gate.set_display_sizes(size(1920, 1080), size(2560, 1600));
+        let generation = gate.begin_validation("test-user");
+        gate.finish_validation(generation, "test-user", Ok(true));
+        assert!(!gate.is_desktop_ready());
+        assert_eq!(
+            gate.handle_keyboard(&KeyboardEvent::Pressed {
+                code: 28,
+                extended: false
+            }),
+            None
+        );
+        assert_eq!(
+            gate.snapshot().presentation(),
+            Some(DesktopPresentation::Scale)
+        );
+        assert!(gate.is_desktop_ready());
+    }
+
+    #[test]
+    fn matching_displays_open_without_an_extra_prompt() {
+        let gate = AccessGate::new(PathBuf::from("unused.toml"));
+        gate.set_display_sizes(size(1920, 1080), size(1920, 1080));
+        let generation = gate.begin_validation("test-user");
+        gate.finish_validation(generation, "test-user", Ok(true));
+        assert_eq!(
+            gate.snapshot().presentation(),
+            Some(DesktopPresentation::Native)
+        );
+        assert!(gate.is_desktop_ready());
+    }
+
+    #[test]
+    fn scaling_choice_never_requests_a_physical_resize() {
+        let gate = AccessGate::new(PathBuf::from("unused.toml"));
+        gate.set_display_sizes(size(1920, 1080), size(2560, 1600));
+        let generation = gate.begin_validation("test-user");
+        gate.finish_validation(generation, "test-user", Ok(true));
+        assert_eq!(
+            gate.handle_keyboard(&KeyboardEvent::Pressed {
+                code: 28,
+                extended: false,
+            }),
+            None
+        );
+
+        assert_eq!(gate.request_client_resize(size(1600, 900)), None);
+        assert_eq!(
+            gate.snapshot().presentation(),
+            Some(DesktopPresentation::Scale)
+        );
+        assert!(!gate.should_follow_client_size(size(1600, 900)));
+    }
+
+    #[test]
+    fn match_display_choice_follows_later_client_resizes() {
+        let gate = AccessGate::new(PathBuf::from("unused.toml"));
+        let initial_client = size(1920, 1200);
+        gate.set_display_sizes(initial_client, size(2560, 1600));
+        let generation = gate.begin_validation("test-user");
+        gate.finish_validation(generation, "test-user", Ok(true));
+        gate.handle_keyboard(&KeyboardEvent::Pressed {
+            code: 15,
+            extended: false,
+        });
+        assert_eq!(
+            gate.handle_keyboard(&KeyboardEvent::Pressed {
+                code: 28,
+                extended: false,
+            }),
+            Some(AccessAction::ChangeDisplaySize(initial_client))
+        );
+        assert_eq!(
+            gate.snapshot().presentation(),
+            Some(DesktopPresentation::Scale)
+        );
+        assert!(gate.is_desktop_ready());
+        gate.set_display_sizes(initial_client, initial_client);
+
+        let resized = size(1600, 1000);
+        assert_eq!(
+            gate.request_client_resize(resized),
+            Some(AccessAction::ChangeDisplaySize(resized))
+        );
+        assert_eq!(
+            gate.snapshot().presentation(),
+            Some(DesktopPresentation::Scale)
+        );
+        assert!(gate.should_follow_client_size(resized));
+        gate.set_display_sizes(resized, resized);
+        assert_eq!(
+            gate.snapshot().presentation(),
+            Some(DesktopPresentation::Native)
+        );
+    }
+
+    #[test]
+    fn match_display_accepts_the_closest_mode_for_a_portrait_phone() {
+        let gate = AccessGate::new(PathBuf::from("unused.toml"));
+        let phone = size(1224, 2556);
+        gate.set_display_sizes(phone, size(1920, 1200));
+        let generation = gate.begin_validation("test-user");
+        gate.finish_validation(generation, "test-user", Ok(true));
+        gate.handle_keyboard(&KeyboardEvent::Pressed {
+            code: 15,
+            extended: false,
+        });
+        assert_eq!(
+            gate.handle_keyboard(&KeyboardEvent::Pressed {
+                code: 28,
+                extended: false,
+            }),
+            Some(AccessAction::ChangeDisplaySize(phone))
+        );
+
+        // Windows selected this closest available physical mode in the real
+        // Android regression. The exact phone canvas stays active and the
+        // physical frame is proportionally fitted instead of showing an error.
+        gate.set_display_sizes(phone, size(1280, 1440));
+        assert_eq!(
+            gate.snapshot().presentation(),
+            Some(DesktopPresentation::Scale)
+        );
+        assert_eq!(gate.snapshot().status, AccessStatus::Granted);
+        assert!(gate.is_desktop_ready());
+    }
+
+    #[test]
+    fn authentication_stays_gated_while_the_console_agent_is_unavailable() {
+        let gate = AccessGate::new(PathBuf::from("unused.toml"));
+        gate.set_display_state(size(1920, 1080), size(2560, 1600), false);
+        let generation = gate.begin_validation("test-user");
+        gate.finish_validation(generation, "test-user", Ok(true));
+        assert!(!gate.is_desktop_ready());
+        assert_eq!(gate.snapshot().status, AccessStatus::WaitingForDesktop);
+        gate.set_display_state(size(1920, 1080), size(2560, 1600), true);
+        assert_eq!(gate.snapshot().status, AccessStatus::ResolutionRequired);
     }
 }

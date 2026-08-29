@@ -161,7 +161,7 @@ $task = New-ScheduledTask `
     -Action $taskAction `
     -Principal $taskPrincipal `
     -Settings $taskSettings `
-    -Description 'Restricted maintenance entry for SunRemoteDesktop deploy, repair, and restart operations.'
+    -Description 'Restricted maintenance entry for SunRemoteDesktop deploy, repair, service restart, and session-agent restart operations.'
 Register-ScheduledTask `
     -TaskName $taskName `
     -InputObject $task `

@@ -12,9 +12,15 @@ bytes = "1.10"
 clap = { version = "4.5", features = ["derive"] }
 directories = "6.0"
 eframe = "0.36"
+fast_image_resize = "5.3"
 font8x8 = "0.3"
-ironrdp-pdu = "0.9"
-ironrdp-server = { version = "0.13", features = ["helper", "nscodec"] }
+fontdue = "0.9"
+# This reviewed upstream revision includes the Windows App GCC compatibility
+# fix, positioned mouse-button events, and server-side MS-RDPEI support. Keep
+# all IronRDP workspace crates on the same revision until these changes ship.
+ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702" }
+ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702" }
+ironrdp-server = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702", features = ["helper", "nscodec"] }
 rcgen = "0.14"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
@@ -26,18 +32,27 @@ xcap = { version = "0.9.8", features = ["image"] }
 zeroize = "1.8"
 
 [dev-dependencies]
-ironrdp-connector = "0.10"
-ironrdp-core = "0.2"
-ironrdp-tokio = "0.10"
-ironrdp-server = { version = "0.13", features = ["__bench"] }
+ironrdp-async = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702" }
+ironrdp-connector = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702" }
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702" }
+ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702" }
+ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702" }
+ironrdp-rdpei = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702" }
+ironrdp-session = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702" }
+ironrdp-tokio = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702" }
+ironrdp-server = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702", features = ["__bench"] }
 tokio = { version = "1.48", features = ["test-util"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Authentication_Identity",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

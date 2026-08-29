@@ -4,6 +4,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Graphics::Gdi::{
+    CDS_UPDATEREGISTRY, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL, DM_PELSHEIGHT,
+    DM_PELSWIDTH, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE, EnumDisplaySettingsW,
+};
 use windows::Win32::Security::{LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT, LogonUserW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
@@ -41,7 +45,7 @@ impl DesktopCapture for WindowsDesktopCapture {
 
     fn start(self: Box<Self>, publish: Box<dyn Fn(CapturedFrame) + Send>) -> Result<()> {
         let fps = self.fps;
-        let expected_size = self.size;
+        let mut current_size = self.size;
         thread::Builder::new()
             .name("sunrdp-desktop-capture".to_string())
             .spawn(move || {
@@ -72,15 +76,15 @@ impl DesktopCapture for WindowsDesktopCapture {
                                         break;
                                     }
                                 };
-                                if size != expected_size {
-                                    tracing::warn!(
-                                        expected_width = expected_size.width,
-                                        expected_height = expected_size.height,
+                                if size != current_size {
+                                    tracing::info!(
+                                        previous_width = current_size.width,
+                                        previous_height = current_size.height,
                                         actual_width = size.width,
                                         actual_height = size.height,
-                                        "captured desktop size changed; reacquiring the monitor"
+                                        "captured desktop size changed"
                                     );
-                                    break;
+                                    current_size = size;
                                 }
                                 publish(CapturedFrame {
                                     width: size.width,
@@ -180,10 +184,7 @@ impl InputInjector for WindowsInputInjector {
     fn mouse(&self, event: &ironrdp_server::MouseEvent, desktop: DesktopSize) {
         let (dx, dy, mouse_data, flags) = match event {
             ironrdp_server::MouseEvent::Move { x, y } => {
-                let max_x = i32::from(desktop.width.saturating_sub(1)).max(1);
-                let max_y = i32::from(desktop.height.saturating_sub(1)).max(1);
-                let absolute_x = (i32::from(*x).clamp(0, max_x) * 65535) / max_x;
-                let absolute_y = (i32::from(*y).clamp(0, max_y) * 65535) / max_y;
+                let (absolute_x, absolute_y) = absolute_mouse_position(*x, *y, desktop);
                 (
                     absolute_x,
                     absolute_y,
@@ -192,14 +193,39 @@ impl InputInjector for WindowsInputInjector {
                 )
             }
             ironrdp_server::MouseEvent::RelMove { x, y } => (*x, *y, 0, MOUSEEVENTF_MOVE),
-            ironrdp_server::MouseEvent::LeftPressed => (0, 0, 0, MOUSEEVENTF_LEFTDOWN),
-            ironrdp_server::MouseEvent::LeftReleased => (0, 0, 0, MOUSEEVENTF_LEFTUP),
-            ironrdp_server::MouseEvent::RightPressed => (0, 0, 0, MOUSEEVENTF_RIGHTDOWN),
-            ironrdp_server::MouseEvent::RightReleased => (0, 0, 0, MOUSEEVENTF_RIGHTUP),
-            ironrdp_server::MouseEvent::MiddlePressed => (0, 0, 0, MOUSEEVENTF_MIDDLEDOWN),
-            ironrdp_server::MouseEvent::MiddleReleased => (0, 0, 0, MOUSEEVENTF_MIDDLEUP),
+            ironrdp_server::MouseEvent::Button {
+                x,
+                y,
+                button,
+                pressed,
+            } => {
+                let Some(button_flag) = mouse_button_flag(*button, *pressed) else {
+                    return;
+                };
+                let (absolute_x, absolute_y) = absolute_mouse_position(*x, *y, desktop);
+                (
+                    absolute_x,
+                    absolute_y,
+                    0,
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | button_flag,
+                )
+            }
+            ironrdp_server::MouseEvent::ButtonRel {
+                x,
+                y,
+                button,
+                pressed,
+            } => {
+                let Some(button_flag) = mouse_button_flag(*button, *pressed) else {
+                    return;
+                };
+                (*x, *y, 0, MOUSEEVENTF_MOVE | button_flag)
+            }
             ironrdp_server::MouseEvent::VerticalScroll { value } => {
                 (0, 0, wheel_data(i32::from(*value)), MOUSEEVENTF_WHEEL)
+            }
+            ironrdp_server::MouseEvent::HorizontalScroll { value } => {
+                (0, 0, wheel_data(i32::from(*value)), MOUSEEVENTF_HWHEEL)
             }
             ironrdp_server::MouseEvent::Scroll { x, y } => {
                 if *y != 0 {
@@ -208,10 +234,7 @@ impl InputInjector for WindowsInputInjector {
                     (0, 0, wheel_data(*x), MOUSEEVENTF_HWHEEL)
                 }
             }
-            ironrdp_server::MouseEvent::Button4Pressed
-            | ironrdp_server::MouseEvent::Button4Released
-            | ironrdp_server::MouseEvent::Button5Pressed
-            | ironrdp_server::MouseEvent::Button5Released => return,
+            _ => return,
         };
 
         let input = INPUT {
@@ -231,6 +254,132 @@ impl InputInjector for WindowsInputInjector {
             let _ = SendInput(&[input], size_of::<INPUT>() as i32);
         }
     }
+
+    fn set_display_size(&self, size: DesktopSize) -> Result<()> {
+        set_primary_display_size(size)
+    }
+}
+
+fn absolute_mouse_position(x: u16, y: u16, desktop: DesktopSize) -> (i32, i32) {
+    let max_x = i32::from(desktop.width.saturating_sub(1)).max(1);
+    let max_y = i32::from(desktop.height.saturating_sub(1)).max(1);
+    (
+        (i32::from(x).clamp(0, max_x) * 65535) / max_x,
+        (i32::from(y).clamp(0, max_y) * 65535) / max_y,
+    )
+}
+
+fn mouse_button_flag(
+    button: ironrdp_server::MouseButton,
+    pressed: bool,
+) -> Option<windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS> {
+    Some(match (button, pressed) {
+        (ironrdp_server::MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
+        (ironrdp_server::MouseButton::Left, false) => MOUSEEVENTF_LEFTUP,
+        (ironrdp_server::MouseButton::Right, true) => MOUSEEVENTF_RIGHTDOWN,
+        (ironrdp_server::MouseButton::Right, false) => MOUSEEVENTF_RIGHTUP,
+        (ironrdp_server::MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEDOWN,
+        (ironrdp_server::MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEUP,
+        _ => return None,
+    })
+}
+
+fn set_primary_display_size(size: DesktopSize) -> Result<()> {
+    let mut mode = DEVMODEW {
+        dmSize: u16::try_from(size_of::<DEVMODEW>()).context("DEVMODEW is too large")?,
+        ..Default::default()
+    };
+    anyhow::ensure!(
+        unsafe { EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut mode) }.as_bool(),
+        "read the current primary display mode"
+    );
+    let mut supported = supported_primary_display_sizes()?;
+    let current = DesktopSize {
+        width: u16::try_from(mode.dmPelsWidth).context("current display width is too large")?,
+        height: u16::try_from(mode.dmPelsHeight).context("current display height is too large")?,
+    };
+    if !supported.contains(&current) {
+        supported.push(current);
+    }
+    let selected =
+        closest_display_size(size, &supported).context("no usable primary-display modes")?;
+    if selected != size {
+        tracing::info!(
+            requested_width = size.width,
+            requested_height = size.height,
+            selected_width = selected.width,
+            selected_height = selected.height,
+            "using the closest supported physical-display mode for the client window"
+        );
+    }
+    if selected == current {
+        return Ok(());
+    }
+
+    mode.dmPelsWidth = u32::from(selected.width);
+    mode.dmPelsHeight = u32::from(selected.height);
+    mode.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT;
+    let result =
+        unsafe { ChangeDisplaySettingsExW(None, Some(&mode), None, CDS_UPDATEREGISTRY, None) };
+    anyhow::ensure!(
+        result == DISP_CHANGE_SUCCESSFUL,
+        "Windows rejected the requested {}x{} display mode with status {}",
+        selected.width,
+        selected.height,
+        result.0
+    );
+    tracing::info!(
+        width = selected.width,
+        height = selected.height,
+        "primary display mode changed"
+    );
+    Ok(())
+}
+
+fn supported_primary_display_sizes() -> Result<Vec<DesktopSize>> {
+    let mut sizes = Vec::new();
+    for index in 0.. {
+        let mut mode = DEVMODEW {
+            dmSize: u16::try_from(size_of::<DEVMODEW>()).context("DEVMODEW is too large")?,
+            ..Default::default()
+        };
+        if !unsafe { EnumDisplaySettingsW(None, ENUM_DISPLAY_SETTINGS_MODE(index), &mut mode) }
+            .as_bool()
+        {
+            break;
+        }
+        let (Ok(width), Ok(height)) = (
+            u16::try_from(mode.dmPelsWidth),
+            u16::try_from(mode.dmPelsHeight),
+        ) else {
+            continue;
+        };
+        let size = DesktopSize { width, height };
+        if width >= 200 && height >= 200 && !sizes.contains(&size) {
+            sizes.push(size);
+        }
+    }
+    anyhow::ensure!(!sizes.is_empty(), "enumerate primary-display modes");
+    Ok(sizes)
+}
+
+fn closest_display_size(requested: DesktopSize, supported: &[DesktopSize]) -> Option<DesktopSize> {
+    supported.iter().copied().min_by(|left, right| {
+        display_mode_score(requested, *left).total_cmp(&display_mode_score(requested, *right))
+    })
+}
+
+fn display_mode_score(requested: DesktopSize, candidate: DesktopSize) -> f64 {
+    let requested_width = f64::from(requested.width.max(1));
+    let requested_height = f64::from(requested.height.max(1));
+    let candidate_width = f64::from(candidate.width.max(1));
+    let candidate_height = f64::from(candidate.height.max(1));
+    let aspect_error =
+        ((candidate_width / candidate_height) - (requested_width / requested_height)).abs()
+            / (requested_width / requested_height);
+    let size_error = (candidate_width - requested_width).abs() / requested_width
+        + (candidate_height - requested_height).abs() / requested_height;
+    aspect_error * 8.0 + size_error
 }
 
 fn wheel_data(value: i32) -> u32 {
@@ -294,5 +443,48 @@ mod tests {
     fn frame_size_rejects_empty_capture() {
         assert!(frame_size(0, 1080).is_err());
         assert!(frame_size(1920, 0).is_err());
+    }
+
+    #[test]
+    fn display_mode_selection_prefers_aspect_ratio_then_size() {
+        let modes = [
+            DesktopSize {
+                width: 1920,
+                height: 1080,
+            },
+            DesktopSize {
+                width: 1680,
+                height: 1050,
+            },
+            DesktopSize {
+                width: 1280,
+                height: 1024,
+            },
+        ];
+        assert_eq!(
+            closest_display_size(
+                DesktopSize {
+                    width: 1500,
+                    height: 940,
+                },
+                &modes
+            ),
+            Some(DesktopSize {
+                width: 1680,
+                height: 1050,
+            })
+        );
+    }
+
+    #[test]
+    fn display_mode_selection_keeps_an_exact_mode() {
+        let requested = DesktopSize {
+            width: 1920,
+            height: 1200,
+        };
+        assert_eq!(
+            closest_display_size(requested, &[requested]),
+            Some(requested)
+        );
     }
 }
