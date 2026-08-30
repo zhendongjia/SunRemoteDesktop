@@ -1009,7 +1009,7 @@ fn render_login(canvas: &mut Canvas, layout: UiLayout, snapshot: &AccessSnapshot
     canvas.text(
         layout.content.x,
         title_y + title_size + 6.0,
-        "Sign in with an allowed local Windows account",
+        "Allowed Windows account  •  save it in your RDP client",
         if layout.compact { 13.0 } else { 15.0 },
         [153, 169, 194, 255],
         layout.content.width,
