@@ -210,24 +210,6 @@ impl RdpDisplay {
         display.resize_requests = Some(resize_requests);
         display
     }
-
-    fn forward_pending_access_action(&self) {
-        let Some(AccessAction::ChangeDisplaySize(target)) = self.access_gate.take_pending_action()
-        else {
-            return;
-        };
-        if self
-            .resize_requests
-            .as_ref()
-            .is_none_or(|requests| requests.send(target).is_err())
-        {
-            tracing::warn!(
-                width = target.width,
-                height = target.height,
-                "remembered physical-display resize handler is unavailable"
-            );
-        }
-    }
 }
 
 async fn dynamic_resize_worker(
@@ -300,7 +282,6 @@ impl RdpServerDisplay for RdpDisplay {
         self.client_size.send_replace(client_size);
         self.access_gate
             .set_display_state(client_size, self.hub.size(), self.hub.is_available());
-        self.forward_pending_access_action();
         tracing::info!(
             width = client_size.width,
             height = client_size.height,
@@ -384,7 +365,6 @@ impl RdpServerDisplay for RdpDisplay {
         );
         self.access_gate
             .set_display_state(client_size, self.hub.size(), self.hub.is_available());
-        self.forward_pending_access_action();
         Ok(Box::new(RdpDisplayUpdates {
             receiver: self.hub.subscribe(),
             host_size: self.hub.subscribe_size(),
@@ -392,7 +372,6 @@ impl RdpServerDisplay for RdpDisplay {
             pointer_position: self.hub.subscribe_pointer_position(),
             access: self.access_gate.subscribe(),
             access_gate: self.access_gate.clone(),
-            resize_requests: self.resize_requests.clone(),
             client_size_updates: self.client_size.subscribe(),
             client_size,
             sent_initial: false,
@@ -412,7 +391,6 @@ struct RdpDisplayUpdates {
     pointer_position: watch::Receiver<Option<Point16>>,
     access: watch::Receiver<crate::access::AccessSnapshot>,
     access_gate: AccessGate,
-    resize_requests: Option<mpsc::UnboundedSender<DesktopSize>>,
     client_size_updates: watch::Receiver<DesktopSize>,
     client_size: DesktopSize,
     sent_initial: bool,
@@ -598,19 +576,6 @@ impl RdpDisplayUpdates {
         let available = *self.host_available.borrow_and_update();
         self.access_gate
             .set_display_state(self.client_size, host_size, available);
-        if let Some(AccessAction::ChangeDisplaySize(target)) =
-            self.access_gate.take_pending_action()
-            && self
-                .resize_requests
-                .as_ref()
-                .is_none_or(|requests| requests.send(target).is_err())
-        {
-            tracing::warn!(
-                width = target.width,
-                height = target.height,
-                "remembered physical-display resize handler is unavailable"
-            );
-        }
     }
 
     fn current_update(&mut self) -> Result<DisplayUpdate> {

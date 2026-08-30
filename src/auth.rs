@@ -30,10 +30,6 @@ impl CredentialValidator for LocalAccountValidator {
         &self,
         credentials: &Credentials,
     ) -> Result<CredentialDecision, CredentialValidationError> {
-        if self.access_gate.has_trusted_sign_in() {
-            tracing::info!("trusted RDP client reused its remembered sign-in");
-            return Ok(CredentialDecision::Accept);
-        }
         if credentials.username.trim().is_empty() || credentials.password.is_empty() {
             self.access_gate.show_login();
             tracing::info!("RDP client did not provide credentials; showing SunRDP access screen");
@@ -73,12 +69,6 @@ pub fn verify_account(
 ) -> Result<bool> {
     let (domain, username) = split_account(account);
     verify_credentials(config_path, domain, username, password)
-}
-
-pub fn is_account_allowed(config_path: &std::path::Path, account: &str) -> Result<bool> {
-    let settings = config::load_from(config_path)?;
-    let (domain, username) = split_account(account);
-    Ok(settings.allows_user(&account_candidates(domain, username)))
 }
 
 fn verify_credentials(

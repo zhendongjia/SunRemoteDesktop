@@ -92,13 +92,6 @@ pub fn private_key_path() -> PathBuf {
     data_dir().join("server-key.pem")
 }
 
-pub fn trusted_clients_path() -> PathBuf {
-    // The maintenance directory has an explicit SYSTEM/Administrators DACL in
-    // installed builds. Unlike config.toml, ordinary local users cannot add a
-    // trusted device and silently bypass the access screen.
-    data_dir().join("Maintenance").join("trusted-clients.toml")
-}
-
 pub fn load_from(path: &Path) -> Result<AppConfig> {
     if !path.exists() {
         let mut config = AppConfig::default();

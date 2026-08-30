@@ -23,7 +23,6 @@ ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP.git", r
 ironrdp-server = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702", features = ["helper", "nscodec"] }
 rcgen = "0.14"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 socket2 = { version = "0.6", features = ["all"] }
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = "0.26"
