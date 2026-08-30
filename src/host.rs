@@ -20,6 +20,7 @@ use crate::input::HostInputHandler;
 use crate::platform::{DesktopCapture, DesktopSize, InputInjector};
 use crate::session::SessionCoordinator;
 use crate::touch::DirectTouchFactory;
+use crate::trust::{ClientIdentityResolver, TrustedClientStore};
 
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -106,6 +107,8 @@ async fn run_server_listener(
         build_tls_acceptor(&config::certificate_path(), &config::private_key_path())?;
     let coordinator =
         SessionCoordinator::new(settings.max_clients, hub.clone(), Arc::clone(&injector));
+    let identities = ClientIdentityResolver::discover();
+    let trusted_clients = TrustedClientStore::load(config::trusted_clients_path());
 
     let addr: std::net::SocketAddr = format!("{}:{}", settings.bind_address, settings.port)
         .parse()
@@ -145,8 +148,13 @@ async fn run_server_listener(
                     continue;
                 };
                 let candidate = session.has_other_owner();
-                let access_gate =
-                    AccessGate::new_for_session(config_path.to_path_buf(), session.clone());
+                let identity = identities.resolve(peer.ip());
+                let access_gate = AccessGate::new_for_session(
+                    config_path.to_path_buf(),
+                    session.clone(),
+                    identity.clone(),
+                    trusted_clients.clone(),
+                );
                 let mut server = build_connection_server(
                     addr,
                     &settings,
@@ -160,6 +168,7 @@ async fn run_server_listener(
                 tracing::info!(
                     %peer,
                     session_id = session.id(),
+                    client = %identity.label(),
                     takeover_candidate = candidate,
                     current = coordinator.active_count(),
                     "RDP client accepted"

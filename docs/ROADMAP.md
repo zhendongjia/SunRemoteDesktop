@@ -23,6 +23,7 @@
 - [ ] Read-only mode and per-user control policy.
 - [x] Single-monitor client-sized access UI, explicit scaling and primary-display matching.
 - [x] Single-monitor dynamic Display Control resizing with per-connection scale/match policy.
+- [x] Password-free trusted-client reconnects and remembered display policy without storing credentials.
 - [x] MS-RDPEI primary-contact input for direct-touch taps and single-finger drags.
 - [ ] Native multi-touch gestures and pen forwarding.
 - [ ] Multiple-monitor Display Control layouts.

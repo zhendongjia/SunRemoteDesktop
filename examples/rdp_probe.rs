@@ -372,6 +372,10 @@ async fn run_authenticated_wire_probe(
     let mut confirmation_events = Vec::new();
     if takeover {
         confirmation_events.extend([
+            FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), 80),
+            FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, 80),
+            FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), 80),
+            FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, 80),
             FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), 57),
             FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, 57),
         ]);

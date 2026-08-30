@@ -10,5 +10,6 @@ pub mod platform;
 pub mod service;
 pub(crate) mod session;
 pub mod touch;
+pub(crate) mod trust;
 
 pub const PRODUCT_NAME: &str = "SunRemoteDesktop";
