@@ -1,14 +1,15 @@
 use std::path::Path;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU32, Ordering},
-};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, Codec, CodecProperty, NsCodec};
-use ironrdp_server::{ConnectionHandler, PostConnectionAction, RdpServer};
+use ironrdp_server::RdpServer;
 use rcgen::generate_simple_self_signed;
+use socket2::{SockRef, TcpKeepalive};
+use tokio::net::TcpSocket;
 use tokio::sync::watch;
+use tokio::task::{JoinSet, LocalSet};
 use tokio_rustls::TlsAcceptor;
 
 use crate::access::AccessGate;
@@ -17,7 +18,12 @@ use crate::config;
 use crate::display::{FrameHub, RdpDisplay};
 use crate::input::HostInputHandler;
 use crate::platform::{DesktopCapture, DesktopSize, InputInjector};
+use crate::session::SessionCoordinator;
 use crate::touch::DirectTouchFactory;
+
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 #[cfg(windows)]
 pub async fn run_server(config_path: &Path) -> Result<()> {
@@ -75,33 +81,31 @@ async fn run_server_with_backend(
     injector: Arc<dyn InputInjector>,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
-    let access_gate = AccessGate::new(config_path.to_path_buf());
-    let display =
-        RdpDisplay::with_dynamic_resize(hub.clone(), access_gate.clone(), Arc::clone(&injector));
-    let touch = DirectTouchFactory::new(
-        Arc::clone(&injector),
-        hub.clone(),
-        settings.allow_control,
-        access_gate.clone(),
-    );
-    let input = HostInputHandler::new(
-        Arc::clone(&injector),
-        hub.clone(),
-        settings.allow_control,
-        access_gate.clone(),
-    );
+    let local = LocalSet::new();
+    local
+        .run_until(run_server_listener(
+            settings,
+            config_path,
+            size,
+            hub,
+            injector,
+            shutdown,
+        ))
+        .await
+}
+
+async fn run_server_listener(
+    settings: config::AppConfig,
+    config_path: &Path,
+    size: DesktopSize,
+    hub: FrameHub,
+    injector: Arc<dyn InputInjector>,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> Result<()> {
     let tls_acceptor =
         build_tls_acceptor(&config::certificate_path(), &config::private_key_path())?;
-    let validator = Arc::new(LocalAccountValidator::new(
-        config_path.to_path_buf(),
-        access_gate.clone(),
-    ));
-    let connections = ConnectionLimiter::new(
-        settings.max_clients,
-        access_gate,
-        hub,
-        Arc::clone(&injector),
-    );
+    let coordinator =
+        SessionCoordinator::new(settings.max_clients, hub.clone(), Arc::clone(&injector));
 
     let addr: std::net::SocketAddr = format!("{}:{}", settings.bind_address, settings.port)
         .parse()
@@ -112,8 +116,134 @@ async fn run_server_with_backend(
             )
         })?;
 
+    let socket = match addr {
+        std::net::SocketAddr::V4(_) => TcpSocket::new_v4().context("create IPv4 socket")?,
+        std::net::SocketAddr::V6(_) => TcpSocket::new_v6().context("create IPv6 socket")?,
+    };
+    socket.bind(addr).context("bind SunRDP listener")?;
+    let listener = socket.listen(128).context("start SunRDP listener")?;
+    let mut connections = JoinSet::new();
+    let mut shutdown = shutdown;
+
     tracing::info!("SunRDP graphics policy uses the Windows App compatible NSCodec path");
-    let mut server = RdpServer::builder()
+    tracing::info!(%addr, width = size.width, height = size.height, "SunRDP server listening");
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted.context("accept RDP client")?;
+                if let Err(error) = configure_transport(&stream) {
+                    tracing::warn!(%peer, ?error, "unable to apply RDP TCP keepalive policy");
+                }
+                let Some(session) = coordinator.reserve(peer) else {
+                    tracing::warn!(
+                        %peer,
+                        current = coordinator.active_count(),
+                        maximum = settings.max_clients.saturating_add(1),
+                        "RDP client rejected: owner and takeover candidate slots are full"
+                    );
+                    drop(stream);
+                    continue;
+                };
+                let candidate = session.has_other_owner();
+                let access_gate =
+                    AccessGate::new_for_session(config_path.to_path_buf(), session.clone());
+                let mut server = build_connection_server(
+                    addr,
+                    &settings,
+                    config_path,
+                    hub.clone(),
+                    Arc::clone(&injector),
+                    access_gate,
+                    tls_acceptor.clone(),
+                );
+                session.attach(server.event_sender().clone());
+                tracing::info!(
+                    %peer,
+                    session_id = session.id(),
+                    takeover_candidate = candidate,
+                    current = coordinator.active_count(),
+                    "RDP client accepted"
+                );
+                connections.spawn_local(async move {
+                    let started = tokio::time::Instant::now();
+                    let result = server.run_connection(stream).await;
+                    let duration = started.elapsed();
+                    session.close();
+                    if let Err(error) = result {
+                        tracing::warn!(%peer, ?duration, ?error, "RDP client disconnected after an error");
+                    } else {
+                        tracing::info!(%peer, ?duration, "RDP client disconnected");
+                    }
+                });
+            }
+            Some(joined) = connections.join_next() => {
+                if let Err(error) = joined {
+                    tracing::error!(?error, "SunRDP connection task failed");
+                }
+            }
+            _ = async {
+                match shutdown.as_mut() {
+                    Some(receiver) => wait_for_shutdown(receiver).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                tracing::info!("SunRDP server received the service stop request");
+                break;
+            }
+        }
+    }
+
+    coordinator.disconnect_all("SunRDP server is shutting down");
+    let graceful = async {
+        while let Some(joined) = connections.join_next().await {
+            if let Err(error) = joined {
+                tracing::error!(?error, "SunRDP connection task failed during shutdown");
+            }
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(3), graceful)
+        .await
+        .is_err()
+    {
+        connections.abort_all();
+    }
+    Ok(())
+}
+
+fn configure_transport(stream: &tokio::net::TcpStream) -> Result<()> {
+    stream.set_nodelay(true).context("enable TCP_NODELAY")?;
+    let keepalive = TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+    SockRef::from(stream)
+        .set_tcp_keepalive(&keepalive)
+        .context("enable TCP keepalive")
+}
+
+fn build_connection_server(
+    addr: std::net::SocketAddr,
+    settings: &config::AppConfig,
+    config_path: &Path,
+    hub: FrameHub,
+    injector: Arc<dyn InputInjector>,
+    access_gate: AccessGate,
+    tls_acceptor: TlsAcceptor,
+) -> RdpServer {
+    let display =
+        RdpDisplay::with_dynamic_resize(hub.clone(), access_gate.clone(), Arc::clone(&injector));
+    let touch = DirectTouchFactory::new(
+        Arc::clone(&injector),
+        hub.clone(),
+        settings.allow_control,
+        access_gate.clone(),
+    );
+    let input = HostInputHandler::new(injector, hub, settings.allow_control, access_gate.clone());
+    let validator = Arc::new(LocalAccountValidator::new(
+        config_path.to_path_buf(),
+        access_gate,
+    ));
+    RdpServer::builder()
         .with_addr(addr)
         .with_tls(tls_acceptor)
         .with_input_handler(input)
@@ -125,21 +255,7 @@ async fn run_server_with_backend(
         }))
         .with_bitmap_codecs(display_codecs())
         .with_credential_validator(Some(validator))
-        .with_connection_handler(Some(Box::new(connections)))
-        .build();
-
-    tracing::info!(%addr, width = size.width, height = size.height, "SunRDP server listening");
-    if let Some(mut shutdown) = shutdown {
-        tokio::select! {
-            result = server.run() => result.context("SunRDP server stopped"),
-            _ = wait_for_shutdown(&mut shutdown) => {
-                tracing::info!("SunRDP server received the service stop request");
-                Ok(())
-            }
-        }
-    } else {
-        server.run().await.context("SunRDP server stopped")
-    }
+        .build()
 }
 
 fn display_codecs() -> BitmapCodecs {
@@ -218,107 +334,9 @@ fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor> 
     identity.make_acceptor()
 }
 
-struct ConnectionLimiter {
-    active: AtomicU32,
-    maximum: u32,
-    access_gate: AccessGate,
-    hub: FrameHub,
-    injector: Arc<dyn InputInjector>,
-    original_display_size: Option<DesktopSize>,
-}
-
-impl ConnectionLimiter {
-    fn new(
-        maximum: u32,
-        access_gate: AccessGate,
-        hub: FrameHub,
-        injector: Arc<dyn InputInjector>,
-    ) -> Self {
-        Self {
-            active: AtomicU32::new(0),
-            maximum,
-            access_gate,
-            hub,
-            injector,
-            original_display_size: None,
-        }
-    }
-}
-
-impl ConnectionHandler for ConnectionLimiter {
-    fn on_accept(&mut self, peer: std::net::SocketAddr) -> bool {
-        let current = self.active.fetch_add(1, Ordering::AcqRel) + 1;
-        if current > self.maximum {
-            self.active.fetch_sub(1, Ordering::AcqRel);
-            tracing::warn!(%peer, current, maximum = self.maximum, "RDP client rejected: connection limit reached");
-            false
-        } else {
-            if current == 1 {
-                self.original_display_size = Some(self.hub.size());
-            }
-            self.access_gate.reset();
-            tracing::info!(%peer, current, "RDP client accepted");
-            true
-        }
-    }
-
-    fn on_disconnected(
-        &mut self,
-        peer: std::net::SocketAddr,
-        _duration: std::time::Duration,
-        error: Option<&anyhow::Error>,
-    ) -> PostConnectionAction {
-        let remaining = self.active.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
-        self.access_gate.reset();
-        if remaining == 0
-            && let Some(original) = self.original_display_size.take()
-            && self.hub.size() != original
-        {
-            if let Err(restore_error) = self.injector.set_display_size(original) {
-                tracing::warn!(
-                    ?restore_error,
-                    width = original.width,
-                    height = original.height,
-                    "unable to restore the physical display mode after the last RDP client disconnected"
-                );
-            } else {
-                tracing::info!(
-                    width = original.width,
-                    height = original.height,
-                    "restoring the physical display mode after the last RDP client disconnected"
-                );
-            }
-        }
-        if let Some(error) = error {
-            tracing::warn!(%peer, remaining, ?error, "RDP client disconnected after an error");
-        } else {
-            tracing::info!(%peer, remaining, "RDP client disconnected");
-        }
-        PostConnectionAction::Continue
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
-
-    #[derive(Default)]
-    struct RecordingInjector {
-        display_sizes: Mutex<Vec<DesktopSize>>,
-    }
-
-    impl InputInjector for RecordingInjector {
-        fn keyboard(&self, _event: &ironrdp_server::KeyboardEvent) {}
-
-        fn mouse(&self, _event: &ironrdp_server::MouseEvent, _desktop: DesktopSize) {}
-
-        fn set_display_size(&self, size: DesktopSize) -> Result<()> {
-            self.display_sizes.lock().unwrap().push(size);
-            Ok(())
-        }
-    }
 
     #[test]
     fn production_codec_offer_is_limited_to_nscodec() {
@@ -327,37 +345,21 @@ mod tests {
         assert!(matches!(codecs.0[0].property, CodecProperty::NsCodec(_)));
     }
 
-    #[test]
-    fn last_client_disconnect_restores_the_original_display_mode() {
-        let original = DesktopSize {
-            width: 1366,
-            height: 768,
-        };
-        let changed = DesktopSize {
-            width: 1280,
-            height: 720,
-        };
-        let hub = FrameHub::new(original);
-        let injector = Arc::new(RecordingInjector::default());
-        let mut limiter = ConnectionLimiter::new(
-            1,
-            AccessGate::new("unused.toml".into()),
-            hub.clone(),
-            injector.clone(),
-        );
-        let peer = "127.0.0.1:3389".parse().unwrap();
+    #[tokio::test]
+    async fn accepted_connections_enable_bounded_tcp_keepalive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connected = tokio::net::TcpStream::connect(listener.local_addr().unwrap());
+        let accepted = listener.accept();
+        let (client, accepted) = tokio::join!(connected, accepted);
+        let _client = client.unwrap();
+        let (server, _) = accepted.unwrap();
 
-        assert!(limiter.on_accept(peer));
-        hub.publish(crate::platform::CapturedFrame {
-            width: changed.width,
-            height: changed.height,
-            rgba: vec![0; usize::from(changed.width) * usize::from(changed.height) * 4],
-        });
+        configure_transport(&server).unwrap();
+        let socket = SockRef::from(&server);
+        assert!(socket.keepalive().unwrap());
         assert_eq!(
-            limiter.on_disconnected(peer, std::time::Duration::ZERO, None),
-            PostConnectionAction::Continue
+            socket.tcp_keepalive_retries().unwrap(),
+            TCP_KEEPALIVE_RETRIES
         );
-
-        assert_eq!(*injector.display_sizes.lock().unwrap(), vec![original]);
     }
 }

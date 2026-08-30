@@ -8,6 +8,7 @@ use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 use crate::platform::{CapturedFrame, DesktopSize};
+use crate::session::SessionLease;
 
 const MAX_FIELD_LENGTH: usize = 256;
 
@@ -18,6 +19,7 @@ pub struct AccessGate {
 
 struct AccessGateInner {
     config_path: PathBuf,
+    session: Option<SessionLease>,
     state: Mutex<AccessState>,
     sender: watch::Sender<AccessSnapshot>,
 }
@@ -35,11 +37,13 @@ pub struct AccessSnapshot {
     resolution_selection: ResolutionSelection,
     resolution_policy: Option<ResolutionSelection>,
     presentation: Option<DesktopPresentation>,
+    takeover_required: bool,
+    disconnect_others: bool,
 }
 
 impl AccessSnapshot {
     pub fn is_desktop_ready(&self) -> bool {
-        self.authenticated && self.presentation.is_some()
+        self.authenticated && self.presentation.is_some() && !self.takeover_required
     }
 
     pub fn presentation(&self) -> Option<DesktopPresentation> {
@@ -83,6 +87,7 @@ enum AccessStatus {
     BackendError,
     ResolutionRequired,
     WaitingForDesktop,
+    TakeoverConfirmationRequired,
     Granted,
 }
 
@@ -101,6 +106,8 @@ struct AccessState {
     resolution_selection: ResolutionSelection,
     resolution_policy: Option<ResolutionSelection>,
     presentation: Option<DesktopPresentation>,
+    takeover_required: bool,
+    disconnect_others: bool,
     pointer: (u16, u16),
 }
 
@@ -121,6 +128,8 @@ impl Default for AccessState {
             resolution_selection: ResolutionSelection::Scale,
             resolution_policy: None,
             presentation: None,
+            takeover_required: false,
+            disconnect_others: false,
             pointer: (0, 0),
         }
     }
@@ -140,17 +149,28 @@ impl AccessState {
             resolution_selection: self.resolution_selection,
             resolution_policy: self.resolution_policy,
             presentation: self.presentation,
+            takeover_required: self.takeover_required,
+            disconnect_others: self.disconnect_others,
         }
     }
 }
 
 impl AccessGate {
     pub fn new(config_path: PathBuf) -> Self {
+        Self::new_with_session(config_path, None)
+    }
+
+    pub(crate) fn new_for_session(config_path: PathBuf, session: SessionLease) -> Self {
+        Self::new_with_session(config_path, Some(session))
+    }
+
+    fn new_with_session(config_path: PathBuf, session: Option<SessionLease>) -> Self {
         let state = AccessState::default();
         let (sender, _) = watch::channel(state.snapshot());
         Self {
             inner: Arc::new(AccessGateInner {
                 config_path,
+                session,
                 state: Mutex::new(state),
                 sender,
             }),
@@ -204,6 +224,11 @@ impl AccessGate {
 
         let action = if !state.authenticated {
             None
+        } else if !self.owns_display() {
+            state.takeover_required = true;
+            state.presentation = None;
+            state.status = AccessStatus::ResolutionRequired;
+            None
         } else if !state.host_available {
             state.presentation = None;
             state.status = AccessStatus::WaitingForDesktop;
@@ -255,6 +280,7 @@ impl AccessGate {
         let state = self.lock_state();
         state.authenticated
             && state.host_available
+            && self.owns_display()
             && state.resolution_policy == Some(ResolutionSelection::MatchDisplay)
             && state.client_size == Some(client_size)
     }
@@ -270,9 +296,13 @@ impl AccessGate {
         state.client_size = Some(client_size);
         state.host_size = Some(host_size);
         state.host_available = host_available;
+        state.takeover_required = state.authenticated && self.has_other_owner();
 
         if state.authenticated {
-            if !host_available {
+            if state.takeover_required {
+                state.presentation = None;
+                state.status = AccessStatus::ResolutionRequired;
+            } else if !host_available {
                 state.presentation = None;
                 state.status = AccessStatus::WaitingForDesktop;
             } else if state.client_size == state.host_size {
@@ -317,6 +347,8 @@ impl AccessGate {
         state.authenticated = false;
         state.resolution_policy = None;
         state.presentation = None;
+        state.takeover_required = false;
+        state.disconnect_others = false;
         let generation = state.generation;
         self.publish(&state);
         generation
@@ -332,7 +364,14 @@ impl AccessGate {
             Ok(true) => {
                 state.username = username.trim().to_string();
                 state.authenticated = true;
-                if !state.host_available {
+                state.takeover_required = self.has_other_owner();
+                state.disconnect_others = false;
+                if state.takeover_required {
+                    state.status = AccessStatus::ResolutionRequired;
+                    state.resolution_policy = None;
+                    state.presentation = None;
+                    state.resolution_selection = ResolutionSelection::Scale;
+                } else if !state.host_available {
                     state.status = AccessStatus::WaitingForDesktop;
                     state.presentation = None;
                 } else if state.client_size.is_some() && state.client_size == state.host_size {
@@ -379,7 +418,10 @@ impl AccessGate {
                 if !state.host_available {
                     return None;
                 }
-                let action = handle_resolution_keyboard(&mut state, event);
+                let apply = handle_resolution_keyboard(&mut state, event);
+                let action = apply
+                    .then(|| self.apply_resolution_choice(&mut state))
+                    .flatten();
                 if action.is_some() || !matches!(event, KeyboardEvent::Released { .. }) {
                     self.publish(&state);
                 }
@@ -424,7 +466,7 @@ impl AccessGate {
                 return None;
             }
             let size = state.client_size?;
-            let layout = UiLayout::new(size, state.authenticated);
+            let layout = UiLayout::new(size, state.authenticated, state.takeover_required);
             let (x, y) = state.pointer;
             if state.authenticated {
                 if !state.host_available {
@@ -440,8 +482,13 @@ impl AccessGate {
                     state.status = AccessStatus::ResolutionRequired;
                     self.publish(&state);
                     None
+                } else if layout.takeover.is_some_and(|rect| rect.contains(x, y)) {
+                    state.disconnect_others = !state.disconnect_others;
+                    state.status = AccessStatus::ResolutionRequired;
+                    self.publish(&state);
+                    None
                 } else if layout.submit.contains(x, y) {
-                    let action = apply_resolution_choice(&mut state);
+                    let action = self.apply_resolution_choice(&mut state);
                     self.publish(&state);
                     action
                 } else {
@@ -484,6 +531,39 @@ impl AccessGate {
     pub fn render_frame(&self, size: DesktopSize) -> CapturedFrame {
         let snapshot = self.inner.sender.borrow().clone();
         render_access_frame(size, &snapshot)
+    }
+
+    fn has_other_owner(&self) -> bool {
+        self.inner
+            .session
+            .as_ref()
+            .is_some_and(SessionLease::has_other_owner)
+    }
+
+    fn owns_display(&self) -> bool {
+        self.inner
+            .session
+            .as_ref()
+            .is_none_or(SessionLease::is_owner)
+    }
+
+    fn apply_resolution_choice(&self, state: &mut AccessState) -> Option<AccessAction> {
+        let has_other_owner = self.has_other_owner();
+        state.takeover_required = has_other_owner;
+        if has_other_owner && !state.disconnect_others {
+            state.status = AccessStatus::TakeoverConfirmationRequired;
+            state.presentation = None;
+            return None;
+        }
+
+        if let Some(session) = self.inner.session.as_ref()
+            && !session.is_owner()
+        {
+            session.take_over();
+        }
+        state.takeover_required = false;
+        state.disconnect_others = false;
+        apply_resolution_choice(state)
     }
 
     fn spawn_validation(&self, submission: Option<ValidationSubmission>) {
@@ -554,10 +634,7 @@ fn handle_login_keyboard(state: &mut AccessState, event: &KeyboardEvent) -> (boo
     (changed, submit)
 }
 
-fn handle_resolution_keyboard(
-    state: &mut AccessState,
-    event: &KeyboardEvent,
-) -> Option<AccessAction> {
+fn handle_resolution_keyboard(state: &mut AccessState, event: &KeyboardEvent) -> bool {
     match event {
         KeyboardEvent::Pressed {
             code: 15 | 75 | 77 | 72 | 80,
@@ -568,10 +645,15 @@ fn handle_resolution_keyboard(
                 ResolutionSelection::MatchDisplay => ResolutionSelection::Scale,
             };
             state.status = AccessStatus::ResolutionRequired;
-            None
+            false
         }
-        KeyboardEvent::Pressed { code: 28, .. } => apply_resolution_choice(state),
-        _ => None,
+        KeyboardEvent::Pressed { code: 57, .. } if state.takeover_required => {
+            state.disconnect_others = !state.disconnect_others;
+            state.status = AccessStatus::ResolutionRequired;
+            false
+        }
+        KeyboardEvent::Pressed { code: 28, .. } => true,
+        _ => false,
     }
 }
 
@@ -722,17 +804,24 @@ struct UiLayout {
     content: Rect,
     primary: Rect,
     secondary: Rect,
+    takeover: Option<Rect>,
     submit: Rect,
     compact: bool,
 }
 
 impl UiLayout {
-    fn new(size: DesktopSize, resolution: bool) -> Self {
+    fn new(size: DesktopSize, resolution: bool, takeover_required: bool) -> Self {
         let width = f32::from(size.width);
         let height = f32::from(size.height);
         let compact = height < 620.0 || width < 760.0;
         let margin = if compact { 16.0 } else { 28.0 };
-        let desired_height: f32 = if resolution { 610.0 } else { 620.0 };
+        let desired_height: f32 = if resolution && takeover_required {
+            720.0
+        } else if resolution {
+            610.0
+        } else {
+            620.0
+        };
         let desired_width: f32 = if resolution { 720.0 } else { 610.0 };
         let card = Rect {
             width: desired_width.min(width - margin * 2.0).max(320.0),
@@ -754,8 +843,21 @@ impl UiLayout {
         };
         let field_height = if compact { 50.0 } else { 58.0 };
         let (primary_y, secondary_y, submit_y, item_height) = if resolution {
-            let first = content.y + if compact { 134.0 } else { 164.0 };
-            let option_height = if compact { 72.0 } else { 86.0 };
+            let first = content.y
+                + if takeover_required {
+                    if compact { 116.0 } else { 138.0 }
+                } else if compact {
+                    134.0
+                } else {
+                    164.0
+                };
+            let option_height = if takeover_required {
+                if compact { 62.0 } else { 72.0 }
+            } else if compact {
+                72.0
+            } else {
+                86.0
+            };
             (
                 first,
                 first + option_height + 12.0,
@@ -786,6 +888,12 @@ impl UiLayout {
                 width: content.width,
                 height: item_height,
             },
+            takeover: (resolution && takeover_required).then_some(Rect {
+                x: content.x,
+                y: secondary_y + item_height + 10.0,
+                width: content.width,
+                height: item_height,
+            }),
             submit: Rect {
                 x: content.x,
                 y: submit_y,
@@ -803,7 +911,7 @@ fn render_access_frame(size: DesktopSize, snapshot: &AccessSnapshot) -> Captured
     let waiting = snapshot.authenticated && !snapshot.host_available;
     let resolution =
         snapshot.authenticated && snapshot.host_available && !snapshot.is_desktop_ready();
-    let layout = UiLayout::new(size, resolution);
+    let layout = UiLayout::new(size, resolution, snapshot.takeover_required);
     canvas.rounded_rect(layout.card, 22.0, [16, 27, 46, 245]);
     canvas.rounded_outline(layout.card, 22.0, 1.0, [74, 96, 129, 150]);
     canvas.brand(layout.content.x, layout.content.y, layout.compact);
@@ -1017,6 +1125,7 @@ fn render_resolution(canvas: &mut Canvas, layout: UiLayout, snapshot: &AccessSna
         "Scale to this window",
         "Keep proportions and add bars when needed",
         true,
+        false,
     );
     canvas.option_card(
         layout.secondary,
@@ -1027,13 +1136,34 @@ fn render_resolution(canvas: &mut Canvas, layout: UiLayout, snapshot: &AccessSna
             client.width, client.height
         ),
         false,
+        false,
     );
+    if let Some(takeover) = layout.takeover {
+        canvas.option_card(
+            takeover,
+            snapshot.disconnect_others,
+            "Disconnect other clients",
+            "Take control of the shared physical console",
+            false,
+            true,
+        );
+    }
 
     canvas.button(layout.submit, "Continue");
-    let (message, color) = (
-        "Tab or arrow keys switch options  •  Enter continues",
-        [126, 143, 169, 255],
-    );
+    let (message, color) = match snapshot.status {
+        AccessStatus::TakeoverConfirmationRequired => (
+            "Confirm disconnecting the current client before continuing",
+            [255, 190, 92, 255],
+        ),
+        _ if snapshot.takeover_required => (
+            "Tab changes fit  •  Space confirms takeover  •  Enter continues",
+            [126, 143, 169, 255],
+        ),
+        _ => (
+            "Tab or arrow keys switch options  •  Enter continues",
+            [126, 143, 169, 255],
+        ),
+    };
     canvas.text(
         layout.content.x,
         layout.submit.y + layout.submit.height + 12.0,
@@ -1158,6 +1288,7 @@ impl Canvas {
         title: &str,
         detail: &str,
         recommended: bool,
+        checkbox: bool,
     ) {
         if selected {
             self.rounded_rect(
@@ -1190,23 +1321,54 @@ impl Canvas {
                 [67, 85, 112, 220]
             },
         );
-        self.circle(
-            rect.x + 24.0,
-            rect.y + rect.height / 2.0,
-            8.0,
+        let indicator = Rect {
+            x: rect.x + 16.0,
+            y: rect.y + rect.height / 2.0 - 8.0,
+            width: 16.0,
+            height: 16.0,
+        };
+        if checkbox {
+            self.rounded_rect(
+                indicator,
+                4.0,
+                if selected {
+                    [255, 174, 54, 255]
+                } else {
+                    [42, 57, 80, 255]
+                },
+            );
+            self.rounded_outline(indicator, 4.0, 1.0, [92, 108, 132, 255]);
             if selected {
-                [255, 174, 54, 255]
-            } else {
-                [42, 57, 80, 255]
-            },
-        );
-        if selected {
+                self.rounded_rect(
+                    Rect {
+                        x: indicator.x + 4.0,
+                        y: indicator.y + 4.0,
+                        width: 8.0,
+                        height: 8.0,
+                    },
+                    2.0,
+                    [255, 244, 216, 255],
+                );
+            }
+        } else {
             self.circle(
                 rect.x + 24.0,
                 rect.y + rect.height / 2.0,
-                3.0,
-                [255, 244, 216, 255],
+                8.0,
+                if selected {
+                    [255, 174, 54, 255]
+                } else {
+                    [42, 57, 80, 255]
+                },
             );
+            if selected {
+                self.circle(
+                    rect.x + 24.0,
+                    rect.y + rect.height / 2.0,
+                    3.0,
+                    [255, 244, 216, 255],
+                );
+            }
         }
         let title_y = rect.y + if rect.height < 80.0 { 13.0 } else { 16.0 };
         self.text(
@@ -1461,12 +1623,34 @@ impl PartialEq for AccessSnapshot {
             && self.resolution_selection == other.resolution_selection
             && self.resolution_policy == other.resolution_policy
             && self.presentation == other.presentation
+            && self.takeover_required == other.takeover_required
+            && self.disconnect_others == other.disconnect_others
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::display::FrameHub;
+    use crate::platform::InputInjector;
+    use crate::session::SessionCoordinator;
+
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingInjector {
+        display_sizes: Mutex<Vec<DesktopSize>>,
+    }
+
+    impl InputInjector for RecordingInjector {
+        fn keyboard(&self, _event: &KeyboardEvent) {}
+
+        fn mouse(&self, _event: &MouseEvent, _desktop: DesktopSize) {}
+
+        fn set_display_size(&self, size: DesktopSize) -> anyhow::Result<()> {
+            self.display_sizes.lock().unwrap().push(size);
+            Ok(())
+        }
+    }
 
     fn size(width: u16, height: u16) -> DesktopSize {
         DesktopSize { width, height }
@@ -1630,5 +1814,68 @@ mod tests {
         assert_eq!(gate.snapshot().status, AccessStatus::WaitingForDesktop);
         gate.set_display_state(size(1920, 1080), size(2560, 1600), true);
         assert_eq!(gate.snapshot().status, AccessStatus::ResolutionRequired);
+    }
+
+    #[test]
+    fn authenticated_candidate_must_confirm_before_kicking_the_owner() {
+        let desktop = size(1366, 768);
+        let coordinator = SessionCoordinator::new(
+            1,
+            FrameHub::new(desktop),
+            Arc::new(RecordingInjector::default()),
+        );
+        let owner = coordinator
+            .reserve("127.0.0.1:1001".parse().unwrap())
+            .unwrap();
+        let candidate = coordinator
+            .reserve("127.0.0.1:1002".parse().unwrap())
+            .unwrap();
+        let (owner_quit, mut owner_events) = tokio::sync::mpsc::unbounded_channel();
+        owner.attach(owner_quit);
+        let gate = AccessGate::new_for_session(PathBuf::from("unused.toml"), candidate.clone());
+        gate.set_display_sizes(desktop, desktop);
+        let generation = gate.begin_validation("test-user");
+        gate.finish_validation(generation, "test-user", Ok(true));
+
+        assert!(gate.snapshot().takeover_required);
+        assert!(!gate.is_desktop_ready());
+        assert_eq!(
+            gate.handle_keyboard(&KeyboardEvent::Pressed {
+                code: 28,
+                extended: false,
+            }),
+            None
+        );
+        assert_eq!(
+            gate.snapshot().status,
+            AccessStatus::TakeoverConfirmationRequired
+        );
+        assert!(owner_events.try_recv().is_err());
+
+        gate.handle_keyboard(&KeyboardEvent::Pressed {
+            code: 57,
+            extended: false,
+        });
+        assert!(gate.snapshot().disconnect_others);
+        assert_eq!(
+            gate.handle_keyboard(&KeyboardEvent::Pressed {
+                code: 28,
+                extended: false,
+            }),
+            None
+        );
+        assert!(candidate.is_owner());
+        assert!(gate.is_desktop_ready());
+        assert!(matches!(
+            owner_events.try_recv(),
+            Ok(ironrdp_server::ServerEvent::Quit(reason)) if reason.contains("took over")
+        ));
+    }
+
+    #[test]
+    fn compact_takeover_layout_keeps_confirmation_above_continue() {
+        let layout = UiLayout::new(size(640, 480), true, true);
+        let takeover = layout.takeover.expect("takeover option");
+        assert!(takeover.y + takeover.height < layout.submit.y);
     }
 }

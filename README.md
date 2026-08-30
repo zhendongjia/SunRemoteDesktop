@@ -12,9 +12,9 @@ SunRemoteDesktop 是一个面向长期扩展的桌面共享项目：使用 SunRD
 - SunRDP 服务端核心，可接受标准 RDP 客户端连接。
 - TLS 传输和本地账户密码验证。
 - TLS 内的认证界面支持定时重绘，不依赖桌面持续出帧；认证前不会发送真实桌面或转发键鼠到 Windows。
-- 登录前界面直接采用 RDP 客户端请求的桌面尺寸，并支持键盘、绝对/相对鼠标和 MS-RDPEI 单指触摸；认证后如果客户端与共享屏幕尺寸不同，会先让用户选择缩放到客户端画布或修改共享会话的主显示器分辨率。
+- 登录前界面直接采用 RDP 客户端请求的桌面尺寸，并支持键盘、绝对/相对鼠标和 MS-RDPEI 单指触摸；认证后如果客户端与共享屏幕尺寸不同，会先让用户选择缩放到客户端画布或修改共享会话的主显示器分辨率。如果已有客户端占用物理控制台，后来登录的客户端会在同一页看到“断开其他客户端”选项，明确确认后才会接管。
 - 会话代理可在 Windows 显示模式变化后继续传送新尺寸；缩放模式保持桌面长宽比并居中留边，绝对鼠标坐标按实际画面区域同步换算。
-- 支持 RDP Display Control 动态分辨率：客户端窗口变化会重建 RDP 画布。用户在认证后选“缩放显示”时不会自动改动物理屏；选“匹配显示器”时会优先切换到总像素数不超过客户端画布、且宽高比和尺寸最接近的临时硬件显示模式，避免高分辨率物理桌面缩小后造成字体过小；最后一个 RDP 客户端断开时恢复连接前的本地显示模式。
+- 支持 RDP Display Control 动态分辨率：客户端窗口变化会重建 RDP 画布。用户在认证后选“缩放显示”时不会自动改动物理屏；选“匹配显示器”时会优先切换到总像素数不超过客户端画布、且宽高比和尺寸最接近的临时硬件显示模式，避免高分辨率物理桌面缩小后造成字体过小；控制权在接管时转移，最后一个拥有控制权的 RDP 客户端断开时恢复首个连接前的本地显示模式。
 - Windows 发布配置当前只广告 NSCodec，以兼容会接收 standalone RemoteFX 更新却保持黑屏的 Windows App 版本；不支持 NSCodec 的客户端退回标准位图更新。RemoteFX 编码实现和测试保留，待按客户端能力建立可靠的自适应选择后再启用。
 - 本地账户白名单、端口、帧率、最大连接数和是否允许控制的界面配置。
 - `run`、`agent`、`admin`、`service` 四种公开运行入口，以及只供服务内部使用的隐藏 `console-agent` 入口。
@@ -69,7 +69,7 @@ C:\ProgramData\SunRemoteDesktop\config.toml
 
 默认监听 `3390` 端口，以避开 Windows 自带远程桌面的 3389。客户端地址写作 `主机名:3390`。
 
-认证界面可以用鼠标或客户端的直接触摸模式选择输入框和按钮，也可以使用 `Tab` 切换、`Enter` 提交。当前原生触摸支持单指点击和拖动，多点手势暂不转发。分辨率选择页默认选中不改动本地显示器的“缩放显示”；`Tab`、方向键、鼠标或单指触摸可切换选项。
+认证界面可以用鼠标或客户端的直接触摸模式选择输入框和按钮，也可以使用 `Tab` 切换、`Enter` 提交。当前原生触摸支持单指点击和拖动，多点手势暂不转发。分辨率选择页默认选中不改动本地显示器的“缩放显示”；`Tab`、方向键、鼠标或单指触摸可切换选项。已有客户端在线时，还需点击“断开其他客户端”（键盘可按 `Space`）再按 `Enter`，服务才会断开旧会话并让新客户端接管。
 如果连接后黑屏或卡顿，请记录客户端名称/版本、是否已通过认证、黑屏后按 `Tab` 是否恢复。
 监听端口和出现认证界面都不能替代认证后真实桌面及键鼠控制的端到端验证。
 Windows 服务的运行日志写入 `C:\ProgramData\SunRemoteDesktop\sunrdp-service.log`，包括连接来源、协议错误和断开原因。
@@ -94,6 +94,7 @@ $sha256 = (Get-FileHash -Algorithm SHA256 $candidate).Hash
 - 把版本化服务文件迁移到受保护的 `C:\Program Files\SunRemoteDesktop`；
 - 注册仅限当前维护账户、仅在该账户交互式登录时可启动的最高权限计划任务；
 - 校正服务自动启动、移除旧版会话代理登录启动项并修复防火墙规则；Domain/Private 网络允许入站连接，Public 网络只允许同一本地子网来源；检测到 Tailscale 虚拟网卡时，另建只绑定该网卡且只接受 Tailscale 地址段的规则；
+- 每条 RDP TCP 连接启用 keepalive：空闲 30 秒后每 10 秒探测，连续 3 次失败即由系统回收半开连接，便于设备睡眠或网络切换后及时释放客户端槽位；
 - 部署候选版本，等待端口恢复，失败时恢复旧服务路径。
 
 此后正常部署、重启和权限修复不再请求 UAC：
@@ -128,10 +129,11 @@ cargo run --example rdp_probe -- --codec remotefx --resize 1000x700
 $env:SUNRDP_PROBE_USERNAME = 'SunRdpE2E'
 $env:SUNRDP_PROBE_PASSWORD = Read-Host 'Temporary test-account password' -MaskInput
 cargo run --example rdp_probe -- --authenticate --desktop 1000x700
+cargo run --example rdp_probe -- --authenticate --takeover --desktop 1000x700
 Remove-Item Env:SUNRDP_PROBE_USERNAME,Env:SUNRDP_PROBE_PASSWORD
 ```
 
-认证探针要求所选客户端画布与物理屏尺寸不同；它在 Windows 验证凭据后确认默认“缩放显示”选项，并断言访问页切换为真实桌面时连接仍然存活。加上 `--post-auth-wait-seconds 8` 可在认证后持续消费桌面 Surface 更新，适合同时执行 `scripts/invoke-maintenance.ps1 -Action RestartAgent`，复测控制台代理交接期间 RDP 连接是否保持。它仍不能替代远程设备上的显示质量、网络延迟和本地可见输入检查。
+认证探针要求所选客户端画布与物理屏尺寸不同；它在 Windows 验证凭据后确认默认“缩放显示”选项，并断言访问页切换为真实桌面时连接仍然存活。已有另一探针或真实客户端在线时，`--takeover` 会额外确认“断开其他客户端”复选项。加上 `--post-auth-wait-seconds 8` 可在认证后持续消费桌面 Surface 更新，适合同时执行 `scripts/invoke-maintenance.ps1 -Action RestartAgent`，复测控制台代理交接期间 RDP 连接是否保持。它仍不能替代远程设备上的显示质量、网络延迟和本地可见输入检查。
 
 ## 设计文档
 

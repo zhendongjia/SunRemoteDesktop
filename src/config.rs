@@ -37,8 +37,9 @@ impl AppConfig {
     pub fn normalize(&mut self) {
         self.bind_address = self.bind_address.trim().to_string();
         self.fps = self.fps.clamp(1, 120);
-        // The current access screen owns one authentication state. Keep one
-        // client until authentication state is connection-scoped.
+        // One authenticated client owns the physical console. The server adds
+        // one separate, gated transport slot so a later client can authenticate
+        // and explicitly take over without allowing two active controllers.
         self.max_clients = 1;
         self.allowed_users = self
             .allowed_users

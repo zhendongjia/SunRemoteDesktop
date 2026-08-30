@@ -74,6 +74,9 @@ struct Args {
     /// Keep consuming authenticated desktop frames for this many seconds.
     #[arg(long, default_value_t = 0)]
     post_auth_wait_seconds: u64,
+    /// Confirm the gated "Disconnect other clients" option before continuing.
+    #[arg(long)]
+    takeover: bool,
 }
 
 type Stream = TokioFramed<tokio_rustls::client::TlsStream<TcpStream>>;
@@ -351,6 +354,7 @@ async fn run_authenticated_wire_probe(
     stream: &mut Stream,
     size: DesktopSize,
     post_auth_wait: Duration,
+    takeover: bool,
 ) -> Result<()> {
     let started = Instant::now();
     let mut reader = SurfaceReader::default();
@@ -365,13 +369,23 @@ async fn run_authenticated_wire_probe(
     // resolution-choice page. Enter confirms its default scaling policy. A
     // complete follow-up surface proves the server kept the same connection
     // alive while opening the captured physical desktop.
-    let enter = FastPathInput::new(vec![
+    let mut confirmation_events = Vec::new();
+    if takeover {
+        confirmation_events.extend([
+            FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), 57),
+            FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, 57),
+        ]);
+    }
+    confirmation_events.extend([
         FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), 28),
         FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, 28),
-    ])?;
+    ]);
+    let confirmation = FastPathInput::new(confirmation_events)?;
     let input_started = Instant::now();
     let bytes_before = reader.bytes;
-    stream.write_all(&ironrdp_core::encode_vec(&enter)?).await?;
+    stream
+        .write_all(&ironrdp_core::encode_vec(&confirmation)?)
+        .await?;
     let desktop_codec = read_full_screen(&mut reader, stream, size).await?;
     println!(
         "authenticated_desktop: codec_id={desktop_codec}, rdp_bytes={}, connection_alive=true, response_ms={}",
@@ -932,6 +946,7 @@ async fn main() -> Result<()> {
             &mut stream,
             initial_size,
             Duration::from_secs(args.post_auth_wait_seconds),
+            args.takeover,
         )
         .await;
     }
@@ -939,6 +954,7 @@ async fn main() -> Result<()> {
         args.post_auth_wait_seconds == 0,
         "--post-auth-wait-seconds requires --authenticate"
     );
+    ensure!(!args.takeover, "--takeover requires --authenticate");
     if args.resize.is_none() {
         return run_wire_probe(&mut stream, initial_size).await;
     }
