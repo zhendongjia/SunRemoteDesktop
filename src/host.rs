@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ironrdp_pdu::rdp::capability_sets::{BitmapCodecs, Codec, CodecProperty, NsCodec};
-use ironrdp_server::RdpServer;
+use ironrdp_server::{RdpServer, TransportTls};
 use rcgen::generate_simple_self_signed;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpSocket;
@@ -17,6 +17,7 @@ use crate::auth::LocalAccountValidator;
 use crate::config;
 use crate::display::{FrameHub, RdpDisplay};
 use crate::input::HostInputHandler;
+use crate::nla::PreparedConnection;
 use crate::platform::{DesktopCapture, DesktopSize, InputInjector};
 use crate::session::SessionCoordinator;
 use crate::touch::DirectTouchFactory;
@@ -102,8 +103,11 @@ async fn run_server_listener(
     injector: Arc<dyn InputInjector>,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
-    let tls_acceptor =
+    let (tls_acceptor, tls_public_key) =
         build_tls_acceptor(&config::certificate_path(), &config::private_key_path())?;
+    let preferences = crate::preferences::ResolutionPreferenceStore::load(
+        config::data_dir().join("preferences.toml"),
+    );
     let coordinator =
         SessionCoordinator::new(settings.max_clients, hub.clone(), Arc::clone(&injector));
 
@@ -146,16 +150,23 @@ async fn run_server_listener(
                 };
                 let candidate = session.has_other_owner();
                 let access_gate =
-                    AccessGate::new_for_session(config_path.to_path_buf(), session.clone());
+                    AccessGate::new_for_session(
+                        config_path.to_path_buf(),
+                        session.clone(),
+                        preferences.clone(),
+                    );
                 let mut server = build_connection_server(
                     addr,
                     &settings,
                     config_path,
                     hub.clone(),
                     Arc::clone(&injector),
-                    access_gate,
+                    access_gate.clone(),
                     tls_acceptor.clone(),
                 );
+                let connection_tls_acceptor = tls_acceptor.clone();
+                let connection_tls_public_key = tls_public_key.clone();
+                let connection_config_path = config_path.to_path_buf();
                 session.attach(server.event_sender().clone());
                 tracing::info!(
                     %peer,
@@ -166,7 +177,27 @@ async fn run_server_listener(
                 );
                 connections.spawn_local(async move {
                     let started = tokio::time::Instant::now();
-                    let result = server.run_connection(stream).await;
+                    let result: anyhow::Result<()> = async {
+                        let prepared = crate::nla::prepare_connection(
+                            stream,
+                            connection_tls_acceptor,
+                            &connection_tls_public_key,
+                            &connection_config_path,
+                            &access_gate,
+                        )
+                        .await?;
+                        match prepared {
+                            PreparedConnection::Standard(stream) => {
+                                server.run_connection(stream).await
+                            }
+                            PreparedConnection::Nla(stream) => {
+                                server
+                                    .run_connection_with(stream, TransportTls::AlreadyDone)
+                                    .await
+                            }
+                        }
+                    }
+                    .await;
                     let duration = started.elapsed();
                     session.close();
                     if let Err(error) = result {
@@ -310,7 +341,7 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
     }
 }
 
-fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor> {
+fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<(TlsAcceptor, Vec<u8>)> {
     if !cert_path.exists() || !key_path.exists() {
         if let Some(parent) = cert_path.parent() {
             std::fs::create_dir_all(parent)
@@ -331,7 +362,8 @@ fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor> 
     }
 
     let identity = ironrdp_server::TlsIdentityCtx::init_from_paths(cert_path, key_path)?;
-    identity.make_acceptor()
+    let acceptor = identity.make_acceptor()?;
+    Ok((acceptor, identity.pub_key))
 }
 
 #[cfg(test)]

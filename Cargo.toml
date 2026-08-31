@@ -23,7 +23,9 @@ ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP.git", r
 ironrdp-server = { git = "https://github.com/Devolutions/IronRDP.git", rev = "aa260fef9ebbc0a420b17e796616d710fb41e702", features = ["helper", "nscodec"] }
 rcgen = "0.14"
 serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
 socket2 = { version = "0.6", features = ["all"] }
+sspi = { version = "0.21", default-features = false }
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = "0.26"
 toml = "0.9"
@@ -51,6 +53,7 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
     "Win32_System_Pipes",
     "Win32_System_RemoteDesktop",
     "Win32_System_StationsAndDesktops",

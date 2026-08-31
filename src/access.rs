@@ -8,6 +8,7 @@ use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 use crate::platform::{CapturedFrame, DesktopSize};
+use crate::preferences::{ResolutionPreference, ResolutionPreferenceStore};
 use crate::session::SessionLease;
 
 const MAX_FIELD_LENGTH: usize = 256;
@@ -20,6 +21,7 @@ pub struct AccessGate {
 struct AccessGateInner {
     config_path: PathBuf,
     session: Option<SessionLease>,
+    preferences: ResolutionPreferenceStore,
     state: Mutex<AccessState>,
     sender: watch::Sender<AccessSnapshot>,
 }
@@ -39,6 +41,9 @@ pub struct AccessSnapshot {
     presentation: Option<DesktopPresentation>,
     takeover_required: bool,
     disconnect_others: bool,
+    remember_resolution: bool,
+    remember_failed: bool,
+    resolution_focus: ResolutionFocus,
 }
 
 impl AccessSnapshot {
@@ -79,6 +84,31 @@ enum ResolutionSelection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolutionFocus {
+    Fit,
+    Remember,
+    Takeover,
+}
+
+impl From<ResolutionPreference> for ResolutionSelection {
+    fn from(value: ResolutionPreference) -> Self {
+        match value {
+            ResolutionPreference::Scale => Self::Scale,
+            ResolutionPreference::MatchDisplay => Self::MatchDisplay,
+        }
+    }
+}
+
+impl From<ResolutionSelection> for ResolutionPreference {
+    fn from(value: ResolutionSelection) -> Self {
+        match value {
+            ResolutionSelection::Scale => Self::Scale,
+            ResolutionSelection::MatchDisplay => Self::MatchDisplay,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AccessStatus {
     Ready,
     MissingCredentials,
@@ -108,6 +138,11 @@ struct AccessState {
     presentation: Option<DesktopPresentation>,
     takeover_required: bool,
     disconnect_others: bool,
+    remember_resolution: bool,
+    remember_failed: bool,
+    resolution_focus: ResolutionFocus,
+    remembered_policy_pending: Option<ResolutionSelection>,
+    pending_action: Option<AccessAction>,
     pointer: (u16, u16),
 }
 
@@ -130,6 +165,11 @@ impl Default for AccessState {
             presentation: None,
             takeover_required: false,
             disconnect_others: false,
+            remember_resolution: false,
+            remember_failed: false,
+            resolution_focus: ResolutionFocus::Fit,
+            remembered_policy_pending: None,
+            pending_action: None,
             pointer: (0, 0),
         }
     }
@@ -151,26 +191,38 @@ impl AccessState {
             presentation: self.presentation,
             takeover_required: self.takeover_required,
             disconnect_others: self.disconnect_others,
+            remember_resolution: self.remember_resolution,
+            remember_failed: self.remember_failed,
+            resolution_focus: self.resolution_focus,
         }
     }
 }
 
 impl AccessGate {
     pub fn new(config_path: PathBuf) -> Self {
-        Self::new_with_session(config_path, None)
+        Self::new_with_session(config_path, None, ResolutionPreferenceStore::default())
     }
 
-    pub(crate) fn new_for_session(config_path: PathBuf, session: SessionLease) -> Self {
-        Self::new_with_session(config_path, Some(session))
+    pub(crate) fn new_for_session(
+        config_path: PathBuf,
+        session: SessionLease,
+        preferences: ResolutionPreferenceStore,
+    ) -> Self {
+        Self::new_with_session(config_path, Some(session), preferences)
     }
 
-    fn new_with_session(config_path: PathBuf, session: Option<SessionLease>) -> Self {
+    fn new_with_session(
+        config_path: PathBuf,
+        session: Option<SessionLease>,
+        preferences: ResolutionPreferenceStore,
+    ) -> Self {
         let state = AccessState::default();
         let (sender, _) = watch::channel(state.snapshot());
         Self {
             inner: Arc::new(AccessGateInner {
                 config_path,
                 session,
+                preferences,
                 state: Mutex::new(state),
                 sender,
             }),
@@ -191,6 +243,10 @@ impl AccessGate {
 
     pub fn is_desktop_ready(&self) -> bool {
         self.lock_state().snapshot().is_desktop_ready()
+    }
+
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.lock_state().authenticated
     }
 
     pub fn reset(&self) {
@@ -305,6 +361,8 @@ impl AccessGate {
             } else if !host_available {
                 state.presentation = None;
                 state.status = AccessStatus::WaitingForDesktop;
+            } else if let Some(selection) = state.remembered_policy_pending.take() {
+                apply_remembered_resolution(&mut state, selection);
             } else if state.client_size == state.host_size {
                 state.presentation = Some(DesktopPresentation::Native);
                 state.status = AccessStatus::Granted;
@@ -331,6 +389,10 @@ impl AccessGate {
         }
     }
 
+    pub fn take_pending_action(&self) -> Option<AccessAction> {
+        self.lock_state().pending_action.take()
+    }
+
     pub fn show_login(&self) {
         let mut state = self.lock_state();
         if !state.authenticated && state.status != AccessStatus::Checking {
@@ -349,12 +411,25 @@ impl AccessGate {
         state.presentation = None;
         state.takeover_required = false;
         state.disconnect_others = false;
+        state.remember_resolution = false;
+        state.remember_failed = false;
+        state.resolution_focus = ResolutionFocus::Fit;
+        state.remembered_policy_pending = None;
+        state.pending_action = None;
         let generation = state.generation;
         self.publish(&state);
         generation
     }
 
     pub fn finish_validation(&self, generation: u64, username: &str, result: anyhow::Result<bool>) {
+        let remembered = match &result {
+            Ok(true) => self
+                .inner
+                .preferences
+                .get(username)
+                .map(ResolutionSelection::from),
+            _ => None,
+        };
         let mut state = self.lock_state();
         if state.generation != generation {
             return;
@@ -366,14 +441,18 @@ impl AccessGate {
                 state.authenticated = true;
                 state.takeover_required = self.has_other_owner();
                 state.disconnect_others = false;
+                state.remembered_policy_pending = remembered;
+                state.remember_resolution = remembered.is_some();
+                state.resolution_selection = remembered.unwrap_or(ResolutionSelection::Scale);
                 if state.takeover_required {
                     state.status = AccessStatus::ResolutionRequired;
                     state.resolution_policy = None;
                     state.presentation = None;
-                    state.resolution_selection = ResolutionSelection::Scale;
                 } else if !state.host_available {
                     state.status = AccessStatus::WaitingForDesktop;
                     state.presentation = None;
+                } else if let Some(selection) = state.remembered_policy_pending.take() {
+                    apply_remembered_resolution(&mut state, selection);
                 } else if state.client_size.is_some() && state.client_size == state.host_size {
                     state.status = AccessStatus::Granted;
                     state.resolution_policy = Some(ResolutionSelection::Scale);
@@ -474,16 +553,25 @@ impl AccessGate {
                 }
                 if layout.primary.contains(x, y) {
                     state.resolution_selection = ResolutionSelection::Scale;
+                    state.resolution_focus = ResolutionFocus::Fit;
                     state.status = AccessStatus::ResolutionRequired;
                     self.publish(&state);
                     None
                 } else if layout.secondary.contains(x, y) {
                     state.resolution_selection = ResolutionSelection::MatchDisplay;
+                    state.resolution_focus = ResolutionFocus::Fit;
+                    state.status = AccessStatus::ResolutionRequired;
+                    self.publish(&state);
+                    None
+                } else if layout.remember.contains(x, y) {
+                    state.remember_resolution = !state.remember_resolution;
+                    state.resolution_focus = ResolutionFocus::Remember;
                     state.status = AccessStatus::ResolutionRequired;
                     self.publish(&state);
                     None
                 } else if layout.takeover.is_some_and(|rect| rect.contains(x, y)) {
                     state.disconnect_others = !state.disconnect_others;
+                    state.resolution_focus = ResolutionFocus::Takeover;
                     state.status = AccessStatus::ResolutionRequired;
                     self.publish(&state);
                     None
@@ -553,6 +641,7 @@ impl AccessGate {
         if has_other_owner && !state.disconnect_others {
             state.status = AccessStatus::TakeoverConfirmationRequired;
             state.presentation = None;
+            state.resolution_focus = ResolutionFocus::Takeover;
             return None;
         }
 
@@ -563,6 +652,15 @@ impl AccessGate {
         }
         state.takeover_required = false;
         state.disconnect_others = false;
+        state.remembered_policy_pending = None;
+        state.pending_action = None;
+        let remembered = state
+            .remember_resolution
+            .then_some(ResolutionPreference::from(state.resolution_selection));
+        if let Err(error) = self.inner.preferences.set(&state.username, remembered) {
+            state.remember_failed = true;
+            tracing::warn!(?error, user = %state.username, "unable to save the account display preference");
+        }
         apply_resolution_choice(state)
     }
 
@@ -636,10 +734,8 @@ fn handle_login_keyboard(state: &mut AccessState, event: &KeyboardEvent) -> (boo
 
 fn handle_resolution_keyboard(state: &mut AccessState, event: &KeyboardEvent) -> bool {
     match event {
-        KeyboardEvent::Pressed {
-            code: 15 | 75 | 77 | 72 | 80,
-            ..
-        } => {
+        KeyboardEvent::Pressed { code: 15, .. } => {
+            state.resolution_focus = ResolutionFocus::Fit;
             state.resolution_selection = match state.resolution_selection {
                 ResolutionSelection::Scale => ResolutionSelection::MatchDisplay,
                 ResolutionSelection::MatchDisplay => ResolutionSelection::Scale,
@@ -647,13 +743,71 @@ fn handle_resolution_keyboard(state: &mut AccessState, event: &KeyboardEvent) ->
             state.status = AccessStatus::ResolutionRequired;
             false
         }
-        KeyboardEvent::Pressed { code: 57, .. } if state.takeover_required => {
-            state.disconnect_others = !state.disconnect_others;
+        KeyboardEvent::Pressed {
+            code: code @ (72 | 80),
+            ..
+        } => {
+            state.resolution_focus = match (state.resolution_focus, *code) {
+                (ResolutionFocus::Fit, 80) => ResolutionFocus::Remember,
+                (ResolutionFocus::Remember, 72) => ResolutionFocus::Fit,
+                (ResolutionFocus::Remember, 80) if state.takeover_required => {
+                    ResolutionFocus::Takeover
+                }
+                (ResolutionFocus::Takeover, 72) => ResolutionFocus::Remember,
+                _ => state.resolution_focus,
+            };
+            state.status = AccessStatus::ResolutionRequired;
+            false
+        }
+        KeyboardEvent::Pressed { code: 75 | 77, .. }
+            if state.resolution_focus == ResolutionFocus::Fit =>
+        {
+            state.resolution_selection = match state.resolution_selection {
+                ResolutionSelection::Scale => ResolutionSelection::MatchDisplay,
+                ResolutionSelection::MatchDisplay => ResolutionSelection::Scale,
+            };
+            state.status = AccessStatus::ResolutionRequired;
+            false
+        }
+        KeyboardEvent::Pressed { code: 57, .. } => {
+            match state.resolution_focus {
+                ResolutionFocus::Fit => {
+                    state.resolution_selection = match state.resolution_selection {
+                        ResolutionSelection::Scale => ResolutionSelection::MatchDisplay,
+                        ResolutionSelection::MatchDisplay => ResolutionSelection::Scale,
+                    };
+                }
+                ResolutionFocus::Remember => {
+                    state.remember_resolution = !state.remember_resolution;
+                }
+                ResolutionFocus::Takeover if state.takeover_required => {
+                    state.disconnect_others = !state.disconnect_others;
+                }
+                ResolutionFocus::Takeover => {}
+            }
             state.status = AccessStatus::ResolutionRequired;
             false
         }
         KeyboardEvent::Pressed { code: 28, .. } => true,
         _ => false,
+    }
+}
+
+fn apply_remembered_resolution(state: &mut AccessState, selection: ResolutionSelection) {
+    state.resolution_selection = selection;
+    state.resolution_policy = Some(selection);
+    let matches_host = state.client_size.is_some() && state.client_size == state.host_size;
+    state.presentation = Some(if matches_host {
+        DesktopPresentation::Native
+    } else {
+        DesktopPresentation::Scale
+    });
+    state.status = AccessStatus::Granted;
+    if selection == ResolutionSelection::MatchDisplay
+        && !matches_host
+        && let Some(client_size) = state.client_size
+    {
+        state.pending_action = Some(AccessAction::ChangeDisplaySize(client_size));
     }
 }
 
@@ -804,6 +958,7 @@ struct UiLayout {
     content: Rect,
     primary: Rect,
     secondary: Rect,
+    remember: Rect,
     takeover: Option<Rect>,
     submit: Rect,
     compact: bool,
@@ -816,9 +971,9 @@ impl UiLayout {
         let compact = height < 620.0 || width < 760.0;
         let margin = if compact { 16.0 } else { 28.0 };
         let desired_height: f32 = if resolution && takeover_required {
-            720.0
+            760.0
         } else if resolution {
-            610.0
+            680.0
         } else {
             620.0
         };
@@ -873,6 +1028,16 @@ impl UiLayout {
                 field_height,
             )
         };
+        let remember = if resolution {
+            Rect {
+                x: content.x,
+                y: secondary_y + item_height + 8.0,
+                width: content.width,
+                height: if compact { 36.0 } else { 54.0 },
+            }
+        } else {
+            Rect::default()
+        };
         Self {
             card,
             content,
@@ -888,11 +1053,12 @@ impl UiLayout {
                 width: content.width,
                 height: item_height,
             },
+            remember,
             takeover: (resolution && takeover_required).then_some(Rect {
                 x: content.x,
-                y: secondary_y + item_height + 10.0,
+                y: remember.y + remember.height + 8.0,
                 width: content.width,
-                height: item_height,
+                height: if compact { 36.0 } else { 54.0 },
             }),
             submit: Rect {
                 x: content.x,
@@ -1138,29 +1304,39 @@ fn render_resolution(canvas: &mut Canvas, layout: UiLayout, snapshot: &AccessSna
         false,
         false,
     );
+    canvas.toggle_row(
+        layout.remember,
+        snapshot.remember_resolution,
+        snapshot.resolution_focus == ResolutionFocus::Remember,
+        "Remember this display choice",
+        "Reuse this fit for the same authenticated Windows account",
+    );
     if let Some(takeover) = layout.takeover {
-        canvas.option_card(
+        canvas.toggle_row(
             takeover,
             snapshot.disconnect_others,
+            snapshot.resolution_focus == ResolutionFocus::Takeover,
             "Disconnect other clients",
             "Take control of the shared physical console",
-            false,
-            true,
         );
     }
 
     canvas.button(layout.submit, "Continue");
     let (message, color) = match snapshot.status {
+        _ if snapshot.remember_failed => (
+            "Connected, but the display preference could not be saved",
+            [255, 190, 92, 255],
+        ),
         AccessStatus::TakeoverConfirmationRequired => (
             "Confirm disconnecting the current client before continuing",
             [255, 190, 92, 255],
         ),
         _ if snapshot.takeover_required => (
-            "Tab changes fit  •  Space confirms takeover  •  Enter continues",
+            "Tab changes fit  •  Up/down moves  •  Space toggles",
             [126, 143, 169, 255],
         ),
         _ => (
-            "Tab or arrow keys switch options  •  Enter continues",
+            "Tab/left/right change fit  •  Down remembers  •  Enter continues",
             [126, 143, 169, 255],
         ),
     };
@@ -1406,6 +1582,73 @@ impl Canvas {
         }
     }
 
+    fn toggle_row(&mut self, rect: Rect, selected: bool, focused: bool, title: &str, detail: &str) {
+        self.rounded_rect(
+            rect,
+            10.0,
+            if selected {
+                [35, 39, 48, 255]
+            } else {
+                [11, 22, 39, 255]
+            },
+        );
+        self.rounded_outline(
+            rect,
+            10.0,
+            if focused || selected { 2.0 } else { 1.0 },
+            if focused || selected {
+                [255, 174, 54, 255]
+            } else {
+                [67, 85, 112, 220]
+            },
+        );
+        let indicator = Rect {
+            x: rect.x + 16.0,
+            y: rect.y + rect.height / 2.0 - 8.0,
+            width: 16.0,
+            height: 16.0,
+        };
+        self.rounded_rect(
+            indicator,
+            4.0,
+            if selected {
+                [255, 174, 54, 255]
+            } else {
+                [42, 57, 80, 255]
+            },
+        );
+        self.rounded_outline(indicator, 4.0, 1.0, [92, 108, 132, 255]);
+        if selected {
+            self.rounded_rect(
+                Rect {
+                    x: indicator.x + 4.0,
+                    y: indicator.y + 4.0,
+                    width: 8.0,
+                    height: 8.0,
+                },
+                2.0,
+                [255, 244, 216, 255],
+            );
+        }
+        let compact = rect.height < 48.0;
+        self.text(
+            rect.x + 45.0,
+            rect.y + if compact { 3.0 } else { 7.0 },
+            title,
+            if compact { 14.0 } else { 15.5 },
+            [240, 245, 253, 255],
+            rect.width - 60.0,
+        );
+        self.text(
+            rect.x + 45.0,
+            rect.y + if compact { 21.0 } else { 29.0 },
+            detail,
+            if compact { 10.0 } else { 11.5 },
+            [139, 156, 182, 255],
+            rect.width - 60.0,
+        );
+    }
+
     fn button(&mut self, rect: Rect, label: &str) {
         self.rounded_rect(rect, 11.0, [255, 169, 42, 255]);
         self.rounded_outline(rect, 11.0, 1.0, [255, 213, 126, 255]);
@@ -1625,6 +1868,9 @@ impl PartialEq for AccessSnapshot {
             && self.presentation == other.presentation
             && self.takeover_required == other.takeover_required
             && self.disconnect_others == other.disconnect_others
+            && self.remember_resolution == other.remember_resolution
+            && self.remember_failed == other.remember_failed
+            && self.resolution_focus == other.resolution_focus
     }
 }
 
@@ -1832,7 +2078,11 @@ mod tests {
             .unwrap();
         let (owner_quit, mut owner_events) = tokio::sync::mpsc::unbounded_channel();
         owner.attach(owner_quit);
-        let gate = AccessGate::new_for_session(PathBuf::from("unused.toml"), candidate.clone());
+        let gate = AccessGate::new_for_session(
+            PathBuf::from("unused.toml"),
+            candidate.clone(),
+            ResolutionPreferenceStore::default(),
+        );
         gate.set_display_sizes(desktop, desktop);
         let generation = gate.begin_validation("test-user");
         gate.finish_validation(generation, "test-user", Ok(true));
@@ -1873,9 +2123,74 @@ mod tests {
     }
 
     #[test]
+    fn remembered_display_choice_is_scoped_to_the_authenticated_account() {
+        let preferences = ResolutionPreferenceStore::default();
+        let first =
+            AccessGate::new_with_session(PathBuf::from("unused.toml"), None, preferences.clone());
+        first.set_display_sizes(size(1600, 900), size(2560, 1600));
+        let generation = first.begin_validation("HOST\\alice");
+        first.finish_validation(generation, "HOST\\alice", Ok(true));
+        first.handle_keyboard(&KeyboardEvent::Pressed {
+            code: 80,
+            extended: false,
+        });
+        first.handle_keyboard(&KeyboardEvent::Pressed {
+            code: 57,
+            extended: false,
+        });
+        first.handle_keyboard(&KeyboardEvent::Pressed {
+            code: 28,
+            extended: false,
+        });
+        assert_eq!(
+            preferences.get("host\\ALICE"),
+            Some(ResolutionPreference::Scale)
+        );
+
+        let alice =
+            AccessGate::new_with_session(PathBuf::from("unused.toml"), None, preferences.clone());
+        alice.set_display_sizes(size(1600, 900), size(2560, 1600));
+        let generation = alice.begin_validation("host\\alice");
+        alice.finish_validation(generation, "host\\alice", Ok(true));
+        assert!(alice.is_desktop_ready());
+        assert_eq!(
+            alice.snapshot().presentation(),
+            Some(DesktopPresentation::Scale)
+        );
+
+        let bob = AccessGate::new_with_session(PathBuf::from("unused.toml"), None, preferences);
+        bob.set_display_sizes(size(1600, 900), size(2560, 1600));
+        let generation = bob.begin_validation("host\\bob");
+        bob.finish_validation(generation, "host\\bob", Ok(true));
+        assert!(!bob.is_desktop_ready());
+        assert_eq!(bob.snapshot().status, AccessStatus::ResolutionRequired);
+    }
+
+    #[test]
+    fn remembered_match_display_queues_the_physical_resize() {
+        let preferences = ResolutionPreferenceStore::default();
+        preferences
+            .set("alice", Some(ResolutionPreference::MatchDisplay))
+            .unwrap();
+        let gate = AccessGate::new_with_session(PathBuf::from("unused.toml"), None, preferences);
+        let client = size(1600, 900);
+        gate.set_display_sizes(client, size(2560, 1600));
+        let generation = gate.begin_validation("alice");
+        gate.finish_validation(generation, "alice", Ok(true));
+
+        assert!(gate.is_desktop_ready());
+        assert_eq!(
+            gate.take_pending_action(),
+            Some(AccessAction::ChangeDisplaySize(client))
+        );
+        assert!(gate.should_follow_client_size(client));
+    }
+
+    #[test]
     fn compact_takeover_layout_keeps_confirmation_above_continue() {
         let layout = UiLayout::new(size(640, 480), true, true);
         let takeover = layout.takeover.expect("takeover option");
+        assert!(layout.remember.y + layout.remember.height < takeover.y);
         assert!(takeover.y + takeover.height < layout.submit.y);
     }
 }

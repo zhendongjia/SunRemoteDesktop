@@ -71,6 +71,9 @@ struct Args {
     /// Authenticate using SUNRDP_PROBE_USERNAME and SUNRDP_PROBE_PASSWORD.
     #[arg(long)]
     authenticate: bool,
+    /// Authenticate before RDP activation with NLA/CredSSP.
+    #[arg(long, requires = "authenticate")]
+    nla: bool,
     /// Keep consuming authenticated desktop frames for this many seconds.
     #[arg(long, default_value_t = 0)]
     post_auth_wait_seconds: u64,
@@ -99,6 +102,7 @@ fn client_config(
     credentials: Credentials,
     domain: Option<String>,
     autologon: bool,
+    enable_credssp: bool,
 ) -> Result<Config> {
     let codecs = if codec == "nscodec" {
         BitmapCodecs(vec![Codec {
@@ -118,7 +122,7 @@ fn client_config(
         monitor_layout: None,
         desktop_scale_factor: 100,
         enable_tls: true,
-        enable_credssp: false,
+        enable_credssp,
         enable_standard_rdp_security: false,
         credentials,
         domain,
@@ -892,7 +896,14 @@ async fn main() -> Result<()> {
     tcp.set_nodelay(true)?;
     let (credentials, domain, autologon) = probe_credentials(args.authenticate)?;
     let mut connector = ClientConnector::new(
-        client_config(&args.codec, args.desktop, credentials, domain, autologon)?,
+        client_config(
+            &args.codec,
+            args.desktop,
+            credentials,
+            domain,
+            autologon,
+            args.nla,
+        )?,
         tcp.local_addr()?,
     );
     if args.resize.is_some() {

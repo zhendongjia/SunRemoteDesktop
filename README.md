@@ -10,7 +10,7 @@ SunRemoteDesktop 是一个面向长期扩展的桌面共享项目：使用 SunRD
 - 控制台代理只附着到 `WTSGetActiveConsoleSessionId` 对应的物理控制台，并跟随 `default`、`winlogon` 和 `screensaver` 输入桌面切换；捕获和键鼠操作会同时呈现在本地显示器上。
 - 版本化本地命名管道桥；画面拥塞时只保留最新帧，输入走独立反向通道。
 - SunRDP 服务端核心，可接受标准 RDP 客户端连接。
-- TLS 传输和本地账户密码验证。
+- TLS 传输、Windows NLA/CredSSP 和本地账户白名单验证；不支持 NLA 的客户端仍可使用加密的 SunRDP 登录页。
 - TLS 内的认证界面支持定时重绘，不依赖桌面持续出帧；认证前不会发送真实桌面或转发键鼠到 Windows。
 - 登录前界面直接采用 RDP 客户端请求的桌面尺寸，并支持键盘、绝对/相对鼠标和 MS-RDPEI 单指触摸；认证后如果客户端与共享屏幕尺寸不同，会先让用户选择缩放到客户端画布或修改共享会话的主显示器分辨率。如果已有客户端占用物理控制台，后来登录的客户端会在同一页看到“断开其他客户端”选项，明确确认后才会接管。
 - 会话代理可在 Windows 显示模式变化后继续传送新尺寸；缩放模式保持桌面长宽比并居中留边，绝对鼠标坐标按实际画面区域同步换算。
@@ -69,9 +69,9 @@ C:\ProgramData\SunRemoteDesktop\config.toml
 
 默认监听 `3390` 端口，以避开 Windows 自带远程桌面的 3389。客户端地址写作 `主机名:3390`。
 
-如果不想每次在 SunRDP 登录页手动输入账户和密码，应让 RDP 客户端保存凭据，而不是让服务端按来源 IP、NAT、代理或 Tailscale 节点跳过认证。在 macOS 的 Windows App 中，打开该远程 PC 卡片的 `…` → `Edit`，在 `Saved credential` 选择 `Add Saved Credential`，保存允许登录的 Windows 账户并关联到这台远程 PC。以后 Windows App 会在每次新连接中重新提交该凭据，SunRDP 仍会执行本地账户验证和 `allowed_users` 白名单检查；多人共用路由器或代理时不会互相继承登录权限。
+如果不想每次在 SunRDP 登录页手动输入账户和密码，应让 RDP 客户端保存凭据，而不是让服务端按来源 IP、NAT、代理或 Tailscale 节点跳过认证。在 macOS 的 Windows App 中，打开该远程 PC 卡片的 `…` → `Edit`，在 `Saved credential` 选择 `Add Saved Credential`，保存允许登录的 Windows 账户并关联到这台远程 PC。以后 Windows App 会在每次连接时通过 NLA/CredSSP 重新证明该 Windows 身份，凭据由客户端系统保管；SunRDP 使用 Windows Negotiate/SSPI 校验认证结果并应用 `allowed_users` 白名单，服务端不保存密码。多人共用路由器或代理时不会互相继承登录权限。客户端没有请求 NLA 时，仍会进入原有的 TLS 加密登录页，并由 `LogonUser` 逐次验证本次提交的密码。
 
-认证界面可以用鼠标或客户端的直接触摸模式选择输入框和按钮，也可以使用 `Tab` 切换、`Enter` 提交。当前原生触摸支持单指点击和拖动，多点手势暂不转发。分辨率选择页默认选中不改动本地显示器的“缩放显示”；`Tab`、方向键、鼠标或单指触摸可切换选项。已有客户端在线时，还需点击“断开其他客户端”（键盘可按 `Space`）再按 `Enter`，服务才会断开旧会话并让新客户端接管。
+认证界面可以用鼠标或客户端的直接触摸模式选择输入框和按钮，也可以使用 `Tab` 切换、`Enter` 提交。当前原生触摸支持单指点击和拖动，多点手势暂不转发。分辨率选择页默认选中不改动本地显示器的“缩放显示”；`Tab`、方向键、鼠标或单指触摸可切换选项。勾选“Remember this display choice”后，服务只按已经通过 Windows 认证的账户保存 `缩放/匹配` 策略，下次该账户连接会自动复用；它不使用来源 IP、路由器、代理或客户端自报名称，也不保存密码。已有客户端在线时，即使存在已记住的策略，后来连接仍必须明确勾选“断开其他客户端”（键盘可在提示后按 `Space`）再按 `Enter`，服务才会断开旧会话并让新客户端接管。
 如果连接后黑屏或卡顿，请记录客户端名称/版本、是否已通过认证、黑屏后按 `Tab` 是否恢复。
 监听端口和出现认证界面都不能替代认证后真实桌面及键鼠控制的端到端验证。
 Windows 服务的运行日志写入 `C:\ProgramData\SunRemoteDesktop\sunrdp-service.log`，包括连接来源、协议错误和断开原因。
@@ -131,11 +131,12 @@ cargo run --example rdp_probe -- --codec remotefx --resize 1000x700
 $env:SUNRDP_PROBE_USERNAME = 'SunRdpE2E'
 $env:SUNRDP_PROBE_PASSWORD = Read-Host 'Temporary test-account password' -MaskInput
 cargo run --example rdp_probe -- --authenticate --desktop 1000x700
+cargo run --example rdp_probe -- --authenticate --nla --desktop 1000x700
 cargo run --example rdp_probe -- --authenticate --takeover --desktop 1000x700
 Remove-Item Env:SUNRDP_PROBE_USERNAME,Env:SUNRDP_PROBE_PASSWORD
 ```
 
-认证探针要求所选客户端画布与物理屏尺寸不同；它在 Windows 验证凭据后确认默认“缩放显示”选项，并断言访问页切换为真实桌面时连接仍然存活。已有另一探针或真实客户端在线时，`--takeover` 会额外确认“断开其他客户端”复选项。加上 `--post-auth-wait-seconds 8` 可在认证后持续消费桌面 Surface 更新，适合同时执行 `scripts/invoke-maintenance.ps1 -Action RestartAgent`，复测控制台代理交接期间 RDP 连接是否保持。它仍不能替代远程设备上的显示质量、网络延迟和本地可见输入检查。
+认证探针要求所选客户端画布与物理屏尺寸不同；默认模式复测兼容登录页，增加 `--nla` 后复测 Windows App 使用的连接前 CredSSP 通路。两种模式都会在 Windows 验证身份后确认默认“缩放显示”选项，并断言访问页切换为真实桌面时连接仍然存活。已有另一探针或真实客户端在线时，`--takeover` 会额外确认“断开其他客户端”复选项。加上 `--post-auth-wait-seconds 8` 可在认证后持续消费桌面 Surface 更新，适合同时执行 `scripts/invoke-maintenance.ps1 -Action RestartAgent`，复测控制台代理交接期间 RDP 连接是否保持。它仍不能替代远程设备上的显示质量、网络延迟和本地可见输入检查。
 
 ## 设计文档
 
