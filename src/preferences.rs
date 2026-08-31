@@ -7,13 +7,12 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-const PREFERENCE_SCHEMA_VERSION: u32 = 1;
+const PREFERENCE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ResolutionPreference {
-    Scale,
-    MatchDisplay,
+pub(crate) struct ResolutionPreference {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
 }
 
 #[derive(Clone, Default)]
@@ -171,20 +170,38 @@ mod tests {
         let path = root.join("preferences.toml");
         let store = ResolutionPreferenceStore::load(path.clone());
         store
-            .set("HOST\\Alice", Some(ResolutionPreference::Scale))
+            .set(
+                "HOST\\Alice",
+                Some(ResolutionPreference {
+                    width: 1920,
+                    height: 1200,
+                }),
+            )
             .unwrap();
         store
-            .set("HOST\\Bob", Some(ResolutionPreference::MatchDisplay))
+            .set(
+                "HOST\\Bob",
+                Some(ResolutionPreference {
+                    width: 1280,
+                    height: 800,
+                }),
+            )
             .unwrap();
 
         let reloaded = ResolutionPreferenceStore::load(path.clone());
         assert_eq!(
             reloaded.get("host\\ALICE"),
-            Some(ResolutionPreference::Scale)
+            Some(ResolutionPreference {
+                width: 1920,
+                height: 1200,
+            })
         );
         assert_eq!(
             reloaded.get("host\\bob"),
-            Some(ResolutionPreference::MatchDisplay)
+            Some(ResolutionPreference {
+                width: 1280,
+                height: 800,
+            })
         );
         let serialized = fs::read_to_string(path).unwrap();
         assert!(!serialized.to_lowercase().contains("password"));
@@ -205,7 +222,13 @@ mod tests {
 
         assert!(
             store
-                .set("alice", Some(ResolutionPreference::Scale))
+                .set(
+                    "alice",
+                    Some(ResolutionPreference {
+                        width: 1920,
+                        height: 1080,
+                    }),
+                )
                 .is_err()
         );
         assert_eq!(store.get("alice"), None);

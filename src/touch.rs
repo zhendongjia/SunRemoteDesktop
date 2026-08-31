@@ -120,7 +120,7 @@ fn touch_position(contact: &TouchContact) -> (u16, u16) {
 mod tests {
     use std::sync::Mutex;
 
-    use ironrdp_server::{TouchContactFields, TouchFrame};
+    use ironrdp_server::{KeyboardEvent, TouchContactFields, TouchFrame};
 
     use super::*;
     use crate::platform::DesktopSize;
@@ -202,6 +202,10 @@ mod tests {
         gate.set_display_state(size, size, true);
         let generation = gate.begin_validation("test-user");
         gate.finish_validation(generation, "test-user", Ok(true));
+        gate.handle_keyboard(&KeyboardEvent::Pressed {
+            code: 28,
+            extended: false,
+        });
         let injector = Arc::new(RecordingInjector::default());
         let mut handler = DirectTouchHandler {
             input: HostInputHandler::new(injector.clone(), FrameHub::new(size), true, gate),

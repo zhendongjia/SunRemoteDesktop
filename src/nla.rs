@@ -25,6 +25,8 @@ const PROTOCOL_SSL: u32 = 0x0000_0001;
 const PROTOCOL_HYBRID: u32 = 0x0000_0002;
 const PROTOCOL_HYBRID_EX: u32 = 0x0000_0008;
 
+const EXTENDED_CLIENT_DATA_SUPPORTED: u8 = 0x01;
+
 const EARLY_AUTH_SUCCESS: [u8; 4] = 0_u32.to_le_bytes();
 const EARLY_AUTH_ACCESS_DENIED: [u8; 4] = 5_u32.to_le_bytes();
 
@@ -65,6 +67,12 @@ pub(crate) async fn prepare_connection(
         )));
     };
 
+    tracing::info!(
+        requested_protocols = format_args!("{:#x}", negotiation.requested_protocols),
+        selected_protocol = format_args!("{:#x}", selected_protocol),
+        "RDP client requested Windows NLA"
+    );
+
     stream
         .write_all(&connection_confirm(selected_protocol))
         .await
@@ -88,6 +96,10 @@ pub(crate) async fn prepare_connection(
             .write_all(&EARLY_AUTH_SUCCESS)
             .await
             .context("send CredSSP early-auth success")?;
+        stream
+            .flush()
+            .await
+            .context("flush CredSSP early-auth success")?;
     }
 
     let continuation = tls_continuation_request(request, negotiation.protocol_offset)?;
@@ -162,10 +174,25 @@ fn parse_negotiation_request(packet: &[u8]) -> Result<NegotiationRequest> {
 
 fn connection_confirm(selected_protocol: u32) -> [u8; X224_CONFIRM_SIZE] {
     let mut response = [
-        0x03, 0x00, 0x00, 0x13, // TPKT
-        0x0e, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, // X.224 confirm
-        0x02, 0x00, 0x08, 0x00, // RDP_NEG_RSP
-        0x00, 0x00, 0x00, 0x00,
+        0x03,
+        0x00,
+        0x00,
+        0x13, // TPKT
+        0x0e,
+        0xd0,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00, // X.224 confirm
+        0x02,
+        EXTENDED_CLIENT_DATA_SUPPORTED,
+        0x08,
+        0x00, // RDP_NEG_RSP
+        0x00,
+        0x00,
+        0x00,
+        0x00,
     ];
     response[15..19].copy_from_slice(&selected_protocol.to_le_bytes());
     response
@@ -324,6 +351,7 @@ where
                 &TsRequest {
                     version: peer_version,
                     nego_tokens: Some(accepted.output),
+                    client_nonce: request.client_nonce,
                     ..TsRequest::default()
                 },
             )
@@ -342,6 +370,7 @@ where
                 &TsRequest {
                     version: peer_version,
                     nego_tokens: Some(accepted.output),
+                    client_nonce: request.client_nonce,
                     ..TsRequest::default()
                 },
             )
@@ -372,6 +401,7 @@ where
         &TsRequest {
             version: peer_version,
             pub_key_auth: Some(encrypted_server_binding),
+            client_nonce: Some(nonce),
             ..TsRequest::default()
         },
     )
@@ -381,6 +411,10 @@ where
     ensure!(
         auth_request.version.min(6) == peer_version,
         "CredSSP peer changed protocol version"
+    );
+    ensure!(
+        auth_request.client_nonce.is_none() || auth_request.client_nonce == Some(nonce),
+        "CredSSP peer changed the client nonce"
     );
     let encrypted_credentials = auth_request
         .auth_info
@@ -471,10 +505,10 @@ impl NativeNegotiate {
         };
         use windows::Win32::Security::Authentication::Identity::{
             ASC_REQ_ALLOCATE_MEMORY, ASC_REQ_CONFIDENTIALITY, ASC_REQ_CONNECTION,
-            ASC_REQ_EXTENDED_ERROR, ASC_REQ_INTEGRITY, ASC_REQ_REPLAY_DETECT,
-            ASC_REQ_SEQUENCE_DETECT, AcceptSecurityContext, CompleteAuthToken, FreeContextBuffer,
-            SECBUFFER_EMPTY, SECBUFFER_TOKEN, SECBUFFER_VERSION, SECURITY_NATIVE_DREP, SecBuffer,
-            SecBufferDesc,
+            ASC_REQ_EXTENDED_ERROR, ASC_REQ_INTEGRITY, ASC_REQ_MUTUAL_AUTH, ASC_REQ_REPLAY_DETECT,
+            ASC_REQ_SEQUENCE_DETECT, ASC_REQ_USE_SESSION_KEY, AcceptSecurityContext,
+            CompleteAuthToken, FreeContextBuffer, SECBUFFER_EMPTY, SECBUFFER_TOKEN,
+            SECBUFFER_VERSION, SECURITY_NATIVE_DREP, SecBuffer, SecBufferDesc,
         };
         use windows::Win32::Security::Credentials::SecHandle;
 
@@ -513,8 +547,10 @@ impl NativeNegotiate {
             | ASC_REQ_CONNECTION
             | ASC_REQ_EXTENDED_ERROR
             | ASC_REQ_INTEGRITY
+            | ASC_REQ_MUTUAL_AUTH
             | ASC_REQ_REPLAY_DETECT
-            | ASC_REQ_SEQUENCE_DETECT;
+            | ASC_REQ_SEQUENCE_DETECT
+            | ASC_REQ_USE_SESSION_KEY;
         let status = unsafe {
             AcceptSecurityContext(
                 Some(&self.credentials),
@@ -857,7 +893,7 @@ mod tests {
     fn confirm_selects_requested_protocol() {
         let confirm = connection_confirm(PROTOCOL_HYBRID_EX);
         assert_eq!(&confirm[..4], &[3, 0, 0, 19]);
-        assert_eq!(&confirm[11..15], &[2, 0, 8, 0]);
+        assert_eq!(&confirm[11..15], &[2, EXTENDED_CLIENT_DATA_SUPPORTED, 8, 0]);
         assert_eq!(&confirm[15..19], &PROTOCOL_HYBRID_EX.to_le_bytes());
     }
 

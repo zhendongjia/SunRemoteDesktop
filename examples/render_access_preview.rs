@@ -23,12 +23,35 @@ fn main() -> Result<()> {
         },
     ] {
         let gate = AccessGate::new(PathBuf::from("unused.toml"));
-        gate.set_display_sizes(
+        gate.set_display_capabilities(
             size,
             DesktopSize {
-                width: 2560,
-                height: 1600,
+                width: 1920,
+                height: 1200,
             },
+            vec![
+                DesktopSize {
+                    width: 1280,
+                    height: 720,
+                },
+                DesktopSize {
+                    width: 1366,
+                    height: 768,
+                },
+                DesktopSize {
+                    width: 1600,
+                    height: 900,
+                },
+                DesktopSize {
+                    width: 1920,
+                    height: 1080,
+                },
+                DesktopSize {
+                    width: 1920,
+                    height: 1200,
+                },
+            ],
+            true,
         );
         for character in "jzd".encode_utf16() {
             gate.handle_keyboard(&KeyboardEvent::UnicodePressed(character));

@@ -35,9 +35,11 @@ pub struct AccessSnapshot {
     authenticated: bool,
     client_size: Option<DesktopSize>,
     host_size: Option<DesktopSize>,
+    supported_resolutions: Vec<DesktopSize>,
+    recommended_resolution: Option<DesktopSize>,
     host_available: bool,
-    resolution_selection: ResolutionSelection,
-    resolution_policy: Option<ResolutionSelection>,
+    resolution_selection: Option<DesktopSize>,
+    resolution_policy: Option<DesktopSize>,
     presentation: Option<DesktopPresentation>,
     takeover_required: bool,
     disconnect_others: bool,
@@ -78,34 +80,10 @@ enum AccessField {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResolutionSelection {
-    Scale,
-    MatchDisplay,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResolutionFocus {
     Fit,
     Remember,
     Takeover,
-}
-
-impl From<ResolutionPreference> for ResolutionSelection {
-    fn from(value: ResolutionPreference) -> Self {
-        match value {
-            ResolutionPreference::Scale => Self::Scale,
-            ResolutionPreference::MatchDisplay => Self::MatchDisplay,
-        }
-    }
-}
-
-impl From<ResolutionSelection> for ResolutionPreference {
-    fn from(value: ResolutionSelection) -> Self {
-        match value {
-            ResolutionSelection::Scale => Self::Scale,
-            ResolutionSelection::MatchDisplay => Self::MatchDisplay,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,16 +110,18 @@ struct AccessState {
     generation: u64,
     client_size: Option<DesktopSize>,
     host_size: Option<DesktopSize>,
+    supported_resolutions: Vec<DesktopSize>,
+    recommended_resolution: Option<DesktopSize>,
     host_available: bool,
-    resolution_selection: ResolutionSelection,
-    resolution_policy: Option<ResolutionSelection>,
+    resolution_selection: Option<DesktopSize>,
+    resolution_policy: Option<DesktopSize>,
     presentation: Option<DesktopPresentation>,
     takeover_required: bool,
     disconnect_others: bool,
     remember_resolution: bool,
     remember_failed: bool,
     resolution_focus: ResolutionFocus,
-    remembered_policy_pending: Option<ResolutionSelection>,
+    remembered_resolution_pending: Option<DesktopSize>,
     pending_action: Option<AccessAction>,
     pointer: (u16, u16),
 }
@@ -159,8 +139,10 @@ impl Default for AccessState {
             generation: 0,
             client_size: None,
             host_size: None,
+            supported_resolutions: Vec::new(),
+            recommended_resolution: None,
             host_available: false,
-            resolution_selection: ResolutionSelection::Scale,
+            resolution_selection: None,
             resolution_policy: None,
             presentation: None,
             takeover_required: false,
@@ -168,7 +150,7 @@ impl Default for AccessState {
             remember_resolution: false,
             remember_failed: false,
             resolution_focus: ResolutionFocus::Fit,
-            remembered_policy_pending: None,
+            remembered_resolution_pending: None,
             pending_action: None,
             pointer: (0, 0),
         }
@@ -185,6 +167,8 @@ impl AccessState {
             authenticated: self.authenticated,
             client_size: self.client_size,
             host_size: self.host_size,
+            supported_resolutions: self.supported_resolutions.clone(),
+            recommended_resolution: self.recommended_resolution,
             host_available: self.host_available,
             resolution_selection: self.resolution_selection,
             resolution_policy: self.resolution_policy,
@@ -264,81 +248,46 @@ impl AccessGate {
     }
 
     pub fn set_display_sizes(&self, client_size: DesktopSize, host_size: DesktopSize) {
-        self.set_display_state(client_size, host_size, true);
+        self.set_display_capabilities(client_size, host_size, vec![host_size], true);
     }
 
-    /// Applies a client-side dynamic-resolution request.
-    ///
-    /// The physical console follows the client only after the user explicitly
-    /// selected the "match physical display" option for this connection. In
-    /// scaling mode the RDP canvas still follows the client, but the host mode
-    /// remains untouched.
+    /// Applies a client-side dynamic-resolution request without silently
+    /// changing the physical mode selected by the authenticated user.
     pub fn request_client_resize(&self, client_size: DesktopSize) -> Option<AccessAction> {
         let mut state = self.lock_state();
         let old_snapshot = state.snapshot();
         state.client_size = Some(client_size);
+        state.recommended_resolution =
+            recommend_resolution(client_size, &state.supported_resolutions);
 
-        let action = if !state.authenticated {
-            None
-        } else if !self.owns_display() {
+        if state.authenticated && !self.owns_display() {
             state.takeover_required = true;
             state.presentation = None;
             state.status = AccessStatus::ResolutionRequired;
-            None
-        } else if !state.host_available {
+        } else if state.authenticated && !state.host_available {
             state.presentation = None;
             state.status = AccessStatus::WaitingForDesktop;
-            None
-        } else {
-            let matches_host = state.host_size == Some(client_size);
-            match state.resolution_policy {
-                Some(ResolutionSelection::Scale) => {
-                    state.presentation = Some(if matches_host {
-                        DesktopPresentation::Native
-                    } else {
-                        DesktopPresentation::Scale
-                    });
-                    state.status = AccessStatus::Granted;
-                    None
-                }
-                Some(ResolutionSelection::MatchDisplay) => {
-                    state.presentation = Some(if matches_host {
-                        DesktopPresentation::Native
-                    } else {
-                        DesktopPresentation::Scale
-                    });
-                    state.status = AccessStatus::Granted;
-                    (!matches_host).then_some(AccessAction::ChangeDisplaySize(client_size))
-                }
-                None if matches_host => {
-                    // No choice is necessary when both sides already match. A
-                    // later resize defaults to the non-invasive scaling policy.
-                    state.resolution_policy = Some(ResolutionSelection::Scale);
-                    state.presentation = Some(DesktopPresentation::Native);
-                    state.status = AccessStatus::Granted;
-                    None
-                }
-                None => {
-                    state.presentation = None;
-                    state.status = AccessStatus::ResolutionRequired;
-                    None
-                }
-            }
-        };
+        } else if state.authenticated && state.resolution_policy.is_some() {
+            state.presentation = Some(if state.host_size == Some(client_size) {
+                DesktopPresentation::Native
+            } else {
+                DesktopPresentation::Scale
+            });
+            state.status = AccessStatus::Granted;
+        }
 
         if state.snapshot() != old_snapshot {
             self.publish(&state);
         }
-        action
+        None
     }
 
-    pub fn should_follow_client_size(&self, client_size: DesktopSize) -> bool {
+    pub fn should_apply_display_size(&self, target: DesktopSize) -> bool {
         let state = self.lock_state();
         state.authenticated
             && state.host_available
             && self.owns_display()
-            && state.resolution_policy == Some(ResolutionSelection::MatchDisplay)
-            && state.client_size == Some(client_size)
+            && state.resolution_policy == Some(target)
     }
 
     pub fn set_display_state(
@@ -347,12 +296,34 @@ impl AccessGate {
         host_size: DesktopSize,
         host_available: bool,
     ) {
+        let supported = self.lock_state().supported_resolutions.clone();
+        self.set_display_capabilities(client_size, host_size, supported, host_available);
+    }
+
+    pub fn set_display_capabilities(
+        &self,
+        client_size: DesktopSize,
+        host_size: DesktopSize,
+        mut supported_resolutions: Vec<DesktopSize>,
+        host_available: bool,
+    ) {
+        normalize_resolutions(&mut supported_resolutions, host_size);
         let mut state = self.lock_state();
         let old_snapshot = state.snapshot();
         state.client_size = Some(client_size);
         state.host_size = Some(host_size);
+        state.supported_resolutions = supported_resolutions;
+        state.recommended_resolution =
+            recommend_resolution(client_size, &state.supported_resolutions);
         state.host_available = host_available;
         state.takeover_required = state.authenticated && self.has_other_owner();
+        if !state.authenticated
+            || state
+                .resolution_selection
+                .is_none_or(|selected| !state.supported_resolutions.contains(&selected))
+        {
+            state.resolution_selection = Some(host_size);
+        }
 
         if state.authenticated {
             if state.takeover_required {
@@ -361,22 +332,21 @@ impl AccessGate {
             } else if !host_available {
                 state.presentation = None;
                 state.status = AccessStatus::WaitingForDesktop;
-            } else if let Some(selection) = state.remembered_policy_pending.take() {
-                apply_remembered_resolution(&mut state, selection);
-            } else if state.client_size == state.host_size {
-                state.presentation = Some(DesktopPresentation::Native);
-                state.status = AccessStatus::Granted;
-            } else if state.resolution_policy == Some(ResolutionSelection::Scale) {
-                // The first choice keeps the physical mode fixed even if it is
-                // later changed manually in Windows display settings.
-                state.presentation = Some(DesktopPresentation::Scale);
-                state.status = AccessStatus::Granted;
-            } else if state.resolution_policy == Some(ResolutionSelection::MatchDisplay)
-                && state.presentation == Some(DesktopPresentation::Scale)
-            {
-                // A dynamically requested physical mode may only approximate
-                // an arbitrary window size. Keep the exact RDP canvas and
-                // letterbox the nearest physical mode when necessary.
+            } else if let Some(selection) = state.remembered_resolution_pending.take() {
+                if state.supported_resolutions.contains(&selection) {
+                    apply_remembered_resolution(&mut state, selection);
+                } else {
+                    state.remember_resolution = false;
+                    state.resolution_policy = None;
+                    state.presentation = None;
+                    state.status = AccessStatus::ResolutionRequired;
+                }
+            } else if state.resolution_policy.is_some() {
+                state.presentation = Some(if state.client_size == state.host_size {
+                    DesktopPresentation::Native
+                } else {
+                    DesktopPresentation::Scale
+                });
                 state.status = AccessStatus::Granted;
             } else {
                 state.presentation = None;
@@ -414,8 +384,9 @@ impl AccessGate {
         state.remember_resolution = false;
         state.remember_failed = false;
         state.resolution_focus = ResolutionFocus::Fit;
-        state.remembered_policy_pending = None;
+        state.remembered_resolution_pending = None;
         state.pending_action = None;
+        state.resolution_selection = state.host_size;
         let generation = state.generation;
         self.publish(&state);
         generation
@@ -427,7 +398,10 @@ impl AccessGate {
                 .inner
                 .preferences
                 .get(username)
-                .map(ResolutionSelection::from),
+                .map(|preference| DesktopSize {
+                    width: preference.width,
+                    height: preference.height,
+                }),
             _ => None,
         };
         let mut state = self.lock_state();
@@ -441,9 +415,11 @@ impl AccessGate {
                 state.authenticated = true;
                 state.takeover_required = self.has_other_owner();
                 state.disconnect_others = false;
-                state.remembered_policy_pending = remembered;
+                let remembered = remembered
+                    .filter(|resolution| state.supported_resolutions.contains(resolution));
+                state.remembered_resolution_pending = remembered;
                 state.remember_resolution = remembered.is_some();
-                state.resolution_selection = remembered.unwrap_or(ResolutionSelection::Scale);
+                state.resolution_selection = remembered.or(state.host_size);
                 if state.takeover_required {
                     state.status = AccessStatus::ResolutionRequired;
                     state.resolution_policy = None;
@@ -451,17 +427,13 @@ impl AccessGate {
                 } else if !state.host_available {
                     state.status = AccessStatus::WaitingForDesktop;
                     state.presentation = None;
-                } else if let Some(selection) = state.remembered_policy_pending.take() {
+                } else if let Some(selection) = state.remembered_resolution_pending.take() {
                     apply_remembered_resolution(&mut state, selection);
-                } else if state.client_size.is_some() && state.client_size == state.host_size {
-                    state.status = AccessStatus::Granted;
-                    state.resolution_policy = Some(ResolutionSelection::Scale);
-                    state.presentation = Some(DesktopPresentation::Native);
                 } else {
                     state.status = AccessStatus::ResolutionRequired;
                     state.resolution_policy = None;
                     state.presentation = None;
-                    state.resolution_selection = ResolutionSelection::Scale;
+                    state.resolution_selection = state.host_size;
                 }
                 tracing::info!(user = %state.username, "SunRDP access granted");
             }
@@ -552,13 +524,16 @@ impl AccessGate {
                     return None;
                 }
                 if layout.primary.contains(x, y) {
-                    state.resolution_selection = ResolutionSelection::Scale;
+                    let forward = f32::from(x) >= layout.primary.x + layout.primary.width / 2.0;
+                    cycle_resolution(&mut state, forward);
                     state.resolution_focus = ResolutionFocus::Fit;
                     state.status = AccessStatus::ResolutionRequired;
                     self.publish(&state);
                     None
                 } else if layout.secondary.contains(x, y) {
-                    state.resolution_selection = ResolutionSelection::MatchDisplay;
+                    if let Some(recommended) = state.recommended_resolution {
+                        state.resolution_selection = Some(recommended);
+                    }
                     state.resolution_focus = ResolutionFocus::Fit;
                     state.status = AccessStatus::ResolutionRequired;
                     self.publish(&state);
@@ -608,8 +583,7 @@ impl AccessGate {
             ?error,
             "unable to change the physical display resolution; continuing with proportional scaling"
         );
-        if state.authenticated && state.resolution_policy == Some(ResolutionSelection::MatchDisplay)
-        {
+        if state.authenticated && state.resolution_policy.is_some() {
             state.presentation = Some(DesktopPresentation::Scale);
             state.status = AccessStatus::Granted;
             self.publish(&state);
@@ -652,11 +626,17 @@ impl AccessGate {
         }
         state.takeover_required = false;
         state.disconnect_others = false;
-        state.remembered_policy_pending = None;
+        state.remembered_resolution_pending = None;
         state.pending_action = None;
-        let remembered = state
-            .remember_resolution
-            .then_some(ResolutionPreference::from(state.resolution_selection));
+        let remembered = state.remember_resolution.then(|| {
+            state
+                .resolution_selection
+                .map(|resolution| ResolutionPreference {
+                    width: resolution.width,
+                    height: resolution.height,
+                })
+        });
+        let remembered = remembered.flatten();
         if let Err(error) = self.inner.preferences.set(&state.username, remembered) {
             state.remember_failed = true;
             tracing::warn!(?error, user = %state.username, "unable to save the account display preference");
@@ -735,10 +715,10 @@ fn handle_login_keyboard(state: &mut AccessState, event: &KeyboardEvent) -> (boo
 fn handle_resolution_keyboard(state: &mut AccessState, event: &KeyboardEvent) -> bool {
     match event {
         KeyboardEvent::Pressed { code: 15, .. } => {
-            state.resolution_focus = ResolutionFocus::Fit;
-            state.resolution_selection = match state.resolution_selection {
-                ResolutionSelection::Scale => ResolutionSelection::MatchDisplay,
-                ResolutionSelection::MatchDisplay => ResolutionSelection::Scale,
+            state.resolution_focus = match state.resolution_focus {
+                ResolutionFocus::Fit => ResolutionFocus::Remember,
+                ResolutionFocus::Remember if state.takeover_required => ResolutionFocus::Takeover,
+                ResolutionFocus::Remember | ResolutionFocus::Takeover => ResolutionFocus::Fit,
             };
             state.status = AccessStatus::ResolutionRequired;
             false
@@ -762,20 +742,19 @@ fn handle_resolution_keyboard(state: &mut AccessState, event: &KeyboardEvent) ->
         KeyboardEvent::Pressed { code: 75 | 77, .. }
             if state.resolution_focus == ResolutionFocus::Fit =>
         {
-            state.resolution_selection = match state.resolution_selection {
-                ResolutionSelection::Scale => ResolutionSelection::MatchDisplay,
-                ResolutionSelection::MatchDisplay => ResolutionSelection::Scale,
-            };
+            cycle_resolution(
+                state,
+                matches!(event, KeyboardEvent::Pressed { code: 77, .. }),
+            );
             state.status = AccessStatus::ResolutionRequired;
             false
         }
         KeyboardEvent::Pressed { code: 57, .. } => {
             match state.resolution_focus {
                 ResolutionFocus::Fit => {
-                    state.resolution_selection = match state.resolution_selection {
-                        ResolutionSelection::Scale => ResolutionSelection::MatchDisplay,
-                        ResolutionSelection::MatchDisplay => ResolutionSelection::Scale,
-                    };
+                    if let Some(recommended) = state.recommended_resolution {
+                        state.resolution_selection = Some(recommended);
+                    }
                 }
                 ResolutionFocus::Remember => {
                     state.remember_resolution = !state.remember_resolution;
@@ -793,8 +772,8 @@ fn handle_resolution_keyboard(state: &mut AccessState, event: &KeyboardEvent) ->
     }
 }
 
-fn apply_remembered_resolution(state: &mut AccessState, selection: ResolutionSelection) {
-    state.resolution_selection = selection;
+fn apply_remembered_resolution(state: &mut AccessState, selection: DesktopSize) {
+    state.resolution_selection = Some(selection);
     state.resolution_policy = Some(selection);
     let matches_host = state.client_size.is_some() && state.client_size == state.host_size;
     state.presentation = Some(if matches_host {
@@ -803,34 +782,89 @@ fn apply_remembered_resolution(state: &mut AccessState, selection: ResolutionSel
         DesktopPresentation::Scale
     });
     state.status = AccessStatus::Granted;
-    if selection == ResolutionSelection::MatchDisplay
-        && !matches_host
-        && let Some(client_size) = state.client_size
-    {
-        state.pending_action = Some(AccessAction::ChangeDisplaySize(client_size));
+    if state.host_size != Some(selection) {
+        state.pending_action = Some(AccessAction::ChangeDisplaySize(selection));
     }
 }
 
 fn apply_resolution_choice(state: &mut AccessState) -> Option<AccessAction> {
-    match state.resolution_selection {
-        ResolutionSelection::Scale => {
-            state.resolution_policy = Some(ResolutionSelection::Scale);
-            state.presentation = Some(DesktopPresentation::Scale);
-            state.status = AccessStatus::Granted;
-            None
-        }
-        ResolutionSelection::MatchDisplay => {
-            let target = state.client_size?;
-            state.resolution_policy = Some(ResolutionSelection::MatchDisplay);
-            // A physical display can expose only a finite set of modes, while
-            // clients (especially phones in portrait orientation) request
-            // arbitrary canvas sizes. Start proportional presentation now and
-            // let an exact capture size upgrade it to Native asynchronously.
-            state.presentation = Some(DesktopPresentation::Scale);
-            state.status = AccessStatus::Granted;
-            Some(AccessAction::ChangeDisplaySize(target))
-        }
+    let target = state.resolution_selection?;
+    if !state.supported_resolutions.contains(&target) {
+        state.status = AccessStatus::ResolutionRequired;
+        return None;
     }
+    state.resolution_policy = Some(target);
+    state.presentation = Some(if state.client_size == state.host_size {
+        DesktopPresentation::Native
+    } else {
+        DesktopPresentation::Scale
+    });
+    state.status = AccessStatus::Granted;
+    (state.host_size != Some(target)).then_some(AccessAction::ChangeDisplaySize(target))
+}
+
+fn cycle_resolution(state: &mut AccessState, forward: bool) {
+    if state.supported_resolutions.is_empty() {
+        return;
+    }
+    let current = state
+        .resolution_selection
+        .and_then(|selected| {
+            state
+                .supported_resolutions
+                .iter()
+                .position(|resolution| *resolution == selected)
+        })
+        .unwrap_or(0);
+    let next = if forward {
+        (current + 1) % state.supported_resolutions.len()
+    } else if current == 0 {
+        state.supported_resolutions.len() - 1
+    } else {
+        current - 1
+    };
+    state.resolution_selection = Some(state.supported_resolutions[next]);
+}
+
+fn normalize_resolutions(resolutions: &mut Vec<DesktopSize>, current: DesktopSize) {
+    resolutions.retain(|resolution| resolution.width > 0 && resolution.height > 0);
+    if !resolutions.contains(&current) {
+        resolutions.push(current);
+    }
+    resolutions.sort_unstable_by_key(|resolution| {
+        (
+            u32::from(resolution.width) * u32::from(resolution.height),
+            resolution.width,
+            resolution.height,
+        )
+    });
+    resolutions.dedup();
+}
+
+fn recommend_resolution(client: DesktopSize, supported: &[DesktopSize]) -> Option<DesktopSize> {
+    let client_pixels = u64::from(client.width) * u64::from(client.height);
+    let score = |candidate: &DesktopSize| {
+        let client_aspect = f64::from(client.width) / f64::from(client.height.max(1));
+        let candidate_aspect = f64::from(candidate.width) / f64::from(candidate.height.max(1));
+        let aspect_error = (candidate_aspect - client_aspect).abs() / client_aspect;
+        let size_error = (f64::from(candidate.width) - f64::from(client.width)).abs()
+            / f64::from(client.width.max(1))
+            + (f64::from(candidate.height) - f64::from(client.height)).abs()
+                / f64::from(client.height.max(1));
+        aspect_error * 8.0 + size_error
+    };
+    supported
+        .iter()
+        .filter(|candidate| {
+            u64::from(candidate.width) * u64::from(candidate.height) <= client_pixels
+        })
+        .min_by(|left, right| score(left).total_cmp(&score(right)))
+        .or_else(|| {
+            supported
+                .iter()
+                .min_by(|left, right| score(left).total_cmp(&score(right)))
+        })
+        .copied()
 }
 
 fn prepare_submission(state: &mut AccessState) -> Option<ValidationSubmission> {
@@ -1259,7 +1293,7 @@ fn render_resolution(canvas: &mut Canvas, layout: UiLayout, snapshot: &AccessSna
     canvas.text(
         layout.content.x,
         title_y,
-        "Choose the display fit",
+        "Choose the host resolution",
         title_size,
         [246, 249, 255, 255],
         layout.content.width,
@@ -1273,7 +1307,7 @@ fn render_resolution(canvas: &mut Canvas, layout: UiLayout, snapshot: &AccessSna
         height: 0,
     });
     let dimensions = format!(
-        "Remote client  {} × {}     Shared screen  {} × {}",
+        "Remote client  {} × {}     Current physical screen  {} × {}",
         client.width, client.height, host.width, host.height
     );
     canvas.text(
@@ -1285,31 +1319,46 @@ fn render_resolution(canvas: &mut Canvas, layout: UiLayout, snapshot: &AccessSna
         layout.content.width,
     );
 
+    let selected = snapshot.resolution_selection.unwrap_or(host);
+    let selected_index = snapshot
+        .supported_resolutions
+        .iter()
+        .position(|resolution| *resolution == selected)
+        .unwrap_or(0)
+        + 1;
+    let supported_count = snapshot.supported_resolutions.len().max(1);
     canvas.option_card(
         layout.primary,
-        snapshot.resolution_selection == ResolutionSelection::Scale,
-        "Scale to this window",
-        "Keep proportions and add bars when needed",
         true,
-        false,
-    );
-    canvas.option_card(
-        layout.secondary,
-        snapshot.resolution_selection == ResolutionSelection::MatchDisplay,
-        "Match the physical display",
+        &format!("‹    {} × {}    ›", selected.width, selected.height),
         &format!(
-            "Change the local screen to {} × {}",
-            client.width, client.height
+            "Selected host mode  {} of {}  •  click either side or use left/right",
+            selected_index, supported_count
         ),
         false,
+        false,
+    );
+    let recommended = snapshot.recommended_resolution.unwrap_or(selected);
+    canvas.option_card(
+        layout.secondary,
+        false,
+        &format!(
+            "Recommended for this client: {} × {}",
+            recommended.width, recommended.height
+        ),
+        &format!(
+            "Closest supported match to the client canvas {} × {}",
+            client.width, client.height
+        ),
+        true,
         false,
     );
     canvas.toggle_row(
         layout.remember,
         snapshot.remember_resolution,
         snapshot.resolution_focus == ResolutionFocus::Remember,
-        "Remember this display choice",
-        "Reuse this fit for the same authenticated Windows account",
+        "Remember this resolution",
+        "Reuse this host mode for the same authenticated Windows account",
     );
     if let Some(takeover) = layout.takeover {
         canvas.toggle_row(
@@ -1332,11 +1381,11 @@ fn render_resolution(canvas: &mut Canvas, layout: UiLayout, snapshot: &AccessSna
             [255, 190, 92, 255],
         ),
         _ if snapshot.takeover_required => (
-            "Tab changes fit  •  Up/down moves  •  Space toggles",
+            "Left/right changes mode  •  Space recommends  •  Up/down moves",
             [126, 143, 169, 255],
         ),
         _ => (
-            "Tab/left/right change fit  •  Down remembers  •  Enter continues",
+            "Left/right changes mode  •  Space recommends  •  Enter continues",
             [126, 143, 169, 255],
         ),
     };
@@ -1862,6 +1911,8 @@ impl PartialEq for AccessSnapshot {
             && self.authenticated == other.authenticated
             && self.client_size == other.client_size
             && self.host_size == other.host_size
+            && self.supported_resolutions == other.supported_resolutions
+            && self.recommended_resolution == other.recommended_resolution
             && self.host_available == other.host_available
             && self.resolution_selection == other.resolution_selection
             && self.resolution_policy == other.resolution_policy
@@ -1922,41 +1973,37 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_displays_stay_gated_until_scaling_is_selected() {
+    fn resolution_page_defaults_to_current_mode_and_recommends_for_the_client() {
         let gate = AccessGate::new(PathBuf::from("unused.toml"));
-        gate.set_display_sizes(size(1920, 1080), size(2560, 1600));
+        let client = size(2560, 1600);
+        let current = size(1366, 768);
+        let recommended = size(1920, 1200);
+        gate.set_display_capabilities(
+            client,
+            current,
+            vec![size(1280, 720), current, recommended],
+            true,
+        );
         let generation = gate.begin_validation("test-user");
         gate.finish_validation(generation, "test-user", Ok(true));
         assert!(!gate.is_desktop_ready());
-        assert_eq!(
-            gate.handle_keyboard(&KeyboardEvent::Pressed {
-                code: 28,
-                extended: false
-            }),
-            None
-        );
-        assert_eq!(
-            gate.snapshot().presentation(),
-            Some(DesktopPresentation::Scale)
-        );
-        assert!(gate.is_desktop_ready());
+        assert_eq!(gate.snapshot().resolution_selection, Some(current));
+        assert_eq!(gate.snapshot().recommended_resolution, Some(recommended));
     }
 
     #[test]
-    fn matching_displays_open_without_an_extra_prompt() {
+    fn matching_displays_still_offer_the_supported_mode_picker() {
         let gate = AccessGate::new(PathBuf::from("unused.toml"));
         gate.set_display_sizes(size(1920, 1080), size(1920, 1080));
         let generation = gate.begin_validation("test-user");
         gate.finish_validation(generation, "test-user", Ok(true));
-        assert_eq!(
-            gate.snapshot().presentation(),
-            Some(DesktopPresentation::Native)
-        );
-        assert!(gate.is_desktop_ready());
+        assert!(!gate.is_desktop_ready());
+        assert_eq!(gate.snapshot().status, AccessStatus::ResolutionRequired);
+        assert_eq!(gate.snapshot().resolution_selection, Some(size(1920, 1080)));
     }
 
     #[test]
-    fn scaling_choice_never_requests_a_physical_resize() {
+    fn selecting_the_current_mode_needs_no_physical_resize() {
         let gate = AccessGate::new(PathBuf::from("unused.toml"));
         gate.set_display_sizes(size(1920, 1080), size(2560, 1600));
         let generation = gate.begin_validation("test-user");
@@ -1974,80 +2021,56 @@ mod tests {
             gate.snapshot().presentation(),
             Some(DesktopPresentation::Scale)
         );
-        assert!(!gate.should_follow_client_size(size(1600, 900)));
+        assert!(gate.should_apply_display_size(size(2560, 1600)));
     }
 
     #[test]
-    fn match_display_choice_follows_later_client_resizes() {
+    fn left_right_cycles_real_modes_and_client_resizes_keep_the_choice() {
         let gate = AccessGate::new(PathBuf::from("unused.toml"));
-        let initial_client = size(1920, 1200);
-        gate.set_display_sizes(initial_client, size(2560, 1600));
+        let current = size(1366, 768);
+        let selected = size(1920, 1200);
+        gate.set_display_capabilities(
+            size(2560, 1600),
+            current,
+            vec![size(1280, 720), current, selected],
+            true,
+        );
         let generation = gate.begin_validation("test-user");
         gate.finish_validation(generation, "test-user", Ok(true));
         gate.handle_keyboard(&KeyboardEvent::Pressed {
-            code: 15,
+            code: 77,
             extended: false,
         });
+        assert_eq!(gate.snapshot().resolution_selection, Some(selected));
         assert_eq!(
             gate.handle_keyboard(&KeyboardEvent::Pressed {
                 code: 28,
                 extended: false,
             }),
-            Some(AccessAction::ChangeDisplaySize(initial_client))
-        );
-        assert_eq!(
-            gate.snapshot().presentation(),
-            Some(DesktopPresentation::Scale)
+            Some(AccessAction::ChangeDisplaySize(selected))
         );
         assert!(gate.is_desktop_ready());
-        gate.set_display_sizes(initial_client, initial_client);
+        assert!(gate.should_apply_display_size(selected));
 
         let resized = size(1600, 1000);
-        assert_eq!(
-            gate.request_client_resize(resized),
-            Some(AccessAction::ChangeDisplaySize(resized))
-        );
+        assert_eq!(gate.request_client_resize(resized), None);
         assert_eq!(
             gate.snapshot().presentation(),
             Some(DesktopPresentation::Scale)
         );
-        assert!(gate.should_follow_client_size(resized));
-        gate.set_display_sizes(resized, resized);
-        assert_eq!(
-            gate.snapshot().presentation(),
-            Some(DesktopPresentation::Native)
-        );
+        assert!(gate.should_apply_display_size(selected));
+        assert!(!gate.should_apply_display_size(resized));
     }
 
     #[test]
-    fn match_display_accepts_the_closest_mode_for_a_portrait_phone() {
-        let gate = AccessGate::new(PathBuf::from("unused.toml"));
-        let phone = size(1224, 2556);
-        gate.set_display_sizes(phone, size(1920, 1200));
-        let generation = gate.begin_validation("test-user");
-        gate.finish_validation(generation, "test-user", Ok(true));
-        gate.handle_keyboard(&KeyboardEvent::Pressed {
-            code: 15,
-            extended: false,
-        });
+    fn recommendation_prefers_the_closest_supported_aspect_and_size() {
         assert_eq!(
-            gate.handle_keyboard(&KeyboardEvent::Pressed {
-                code: 28,
-                extended: false,
-            }),
-            Some(AccessAction::ChangeDisplaySize(phone))
+            recommend_resolution(
+                size(2560, 1600),
+                &[size(1366, 768), size(1920, 1080), size(1920, 1200)]
+            ),
+            Some(size(1920, 1200))
         );
-
-        // Windows selected this closest available physical mode in the real
-        // Android regression. The exact phone canvas stays active and the
-        // physical frame is proportionally fitted instead of showing an error.
-        gate.set_display_sizes(phone, size(1280, 1440));
-        assert_eq!(
-            gate.snapshot().presentation(),
-            Some(DesktopPresentation::Scale)
-        );
-        assert_eq!(gate.snapshot().status, AccessStatus::Granted);
-        assert!(gate.is_desktop_ready());
     }
 
     #[test]
@@ -2125,11 +2148,18 @@ mod tests {
     #[test]
     fn remembered_display_choice_is_scoped_to_the_authenticated_account() {
         let preferences = ResolutionPreferenceStore::default();
+        let current = size(1366, 768);
+        let remembered = size(1920, 1200);
+        let modes = vec![current, remembered];
         let first =
             AccessGate::new_with_session(PathBuf::from("unused.toml"), None, preferences.clone());
-        first.set_display_sizes(size(1600, 900), size(2560, 1600));
+        first.set_display_capabilities(size(2560, 1600), current, modes.clone(), true);
         let generation = first.begin_validation("HOST\\alice");
         first.finish_validation(generation, "HOST\\alice", Ok(true));
+        first.handle_keyboard(&KeyboardEvent::Pressed {
+            code: 77,
+            extended: false,
+        });
         first.handle_keyboard(&KeyboardEvent::Pressed {
             code: 80,
             extended: false,
@@ -2144,22 +2174,25 @@ mod tests {
         });
         assert_eq!(
             preferences.get("host\\ALICE"),
-            Some(ResolutionPreference::Scale)
+            Some(ResolutionPreference {
+                width: remembered.width,
+                height: remembered.height,
+            })
         );
 
         let alice =
             AccessGate::new_with_session(PathBuf::from("unused.toml"), None, preferences.clone());
-        alice.set_display_sizes(size(1600, 900), size(2560, 1600));
+        alice.set_display_capabilities(size(2560, 1600), current, modes.clone(), true);
         let generation = alice.begin_validation("host\\alice");
         alice.finish_validation(generation, "host\\alice", Ok(true));
         assert!(alice.is_desktop_ready());
         assert_eq!(
-            alice.snapshot().presentation(),
-            Some(DesktopPresentation::Scale)
+            alice.take_pending_action(),
+            Some(AccessAction::ChangeDisplaySize(remembered))
         );
 
         let bob = AccessGate::new_with_session(PathBuf::from("unused.toml"), None, preferences);
-        bob.set_display_sizes(size(1600, 900), size(2560, 1600));
+        bob.set_display_capabilities(size(2560, 1600), current, modes, true);
         let generation = bob.begin_validation("host\\bob");
         bob.finish_validation(generation, "host\\bob", Ok(true));
         assert!(!bob.is_desktop_ready());
@@ -2167,23 +2200,30 @@ mod tests {
     }
 
     #[test]
-    fn remembered_match_display_queues_the_physical_resize() {
+    fn remembered_resolution_queues_the_physical_resize() {
         let preferences = ResolutionPreferenceStore::default();
+        let current = size(1366, 768);
+        let remembered = size(1920, 1200);
         preferences
-            .set("alice", Some(ResolutionPreference::MatchDisplay))
+            .set(
+                "alice",
+                Some(ResolutionPreference {
+                    width: remembered.width,
+                    height: remembered.height,
+                }),
+            )
             .unwrap();
         let gate = AccessGate::new_with_session(PathBuf::from("unused.toml"), None, preferences);
-        let client = size(1600, 900);
-        gate.set_display_sizes(client, size(2560, 1600));
+        gate.set_display_capabilities(size(2560, 1600), current, vec![current, remembered], true);
         let generation = gate.begin_validation("alice");
         gate.finish_validation(generation, "alice", Ok(true));
 
         assert!(gate.is_desktop_ready());
         assert_eq!(
             gate.take_pending_action(),
-            Some(AccessAction::ChangeDisplaySize(client))
+            Some(AccessAction::ChangeDisplaySize(remembered))
         );
-        assert!(gate.should_follow_client_size(client));
+        assert!(gate.should_apply_display_size(remembered));
     }
 
     #[test]

@@ -29,6 +29,7 @@ const DYNAMIC_RESIZE_DEBOUNCE: Duration = Duration::from_millis(450);
 pub struct FrameHub {
     sender: watch::Sender<Option<Arc<CapturedFrame>>>,
     size_sender: watch::Sender<DesktopSize>,
+    supported_sizes_sender: watch::Sender<Vec<DesktopSize>>,
     available_sender: watch::Sender<bool>,
     pointer_sender: watch::Sender<Option<Point16>>,
     availability_generation: Arc<AtomicU64>,
@@ -82,11 +83,13 @@ impl FrameHub {
         };
         let (sender, _) = watch::channel(Some(Arc::new(initial)));
         let (size_sender, _) = watch::channel(size);
+        let (supported_sizes_sender, _) = watch::channel(vec![size]);
         let (available_sender, _) = watch::channel(available);
         let (pointer_sender, _) = watch::channel(None);
         Self {
             sender,
             size_sender,
+            supported_sizes_sender,
             available_sender,
             pointer_sender,
             availability_generation: Arc::new(AtomicU64::new(0)),
@@ -102,6 +105,12 @@ impl FrameHub {
         };
         if *self.size_sender.borrow() != size {
             self.size_sender.send_replace(size);
+        }
+        if !self.supported_sizes_sender.borrow().contains(&size) {
+            self.supported_sizes_sender.send_modify(|sizes| {
+                sizes.push(size);
+                normalize_display_sizes(sizes);
+            });
         }
         // Cancel any delayed unavailable transition left by the previous
         // console agent before publishing the replacement agent's first frame.
@@ -122,6 +131,29 @@ impl FrameHub {
 
     pub fn subscribe_size(&self) -> watch::Receiver<DesktopSize> {
         self.size_sender.subscribe()
+    }
+
+    pub fn supported_sizes(&self) -> Vec<DesktopSize> {
+        self.supported_sizes_sender.borrow().clone()
+    }
+
+    pub fn set_display_capabilities(
+        &self,
+        current_size: DesktopSize,
+        mut supported_sizes: Vec<DesktopSize>,
+    ) {
+        if *self.size_sender.borrow() != current_size {
+            self.size_sender.send_replace(current_size);
+        }
+        if !supported_sizes.contains(&current_size) {
+            supported_sizes.push(current_size);
+        }
+        normalize_display_sizes(&mut supported_sizes);
+        self.supported_sizes_sender.send_replace(supported_sizes);
+    }
+
+    pub fn subscribe_supported_sizes(&self) -> watch::Receiver<Vec<DesktopSize>> {
+        self.supported_sizes_sender.subscribe()
     }
 
     pub fn is_available(&self) -> bool {
@@ -173,6 +205,18 @@ impl FrameHub {
     fn subscribe_pointer_position(&self) -> watch::Receiver<Option<Point16>> {
         self.pointer_sender.subscribe()
     }
+}
+
+fn normalize_display_sizes(sizes: &mut Vec<DesktopSize>) {
+    sizes.retain(|size| size.width > 0 && size.height > 0);
+    sizes.sort_unstable_by_key(|size| {
+        (
+            u32::from(size.width) * u32::from(size.height),
+            size.width,
+            size.height,
+        )
+    });
+    sizes.dedup();
 }
 
 pub struct RdpDisplay {
@@ -246,7 +290,7 @@ async fn dynamic_resize_worker(
 
         // A disconnect resets the access policy. Do not let a request queued
         // by the previous connection change the physical console afterwards.
-        if !access_gate.should_follow_client_size(target) {
+        if !access_gate.should_apply_display_size(target) {
             continue;
         }
         tracing::info!(
@@ -298,8 +342,12 @@ impl RdpServerDisplay for RdpDisplay {
             _ => handshake_size,
         };
         self.client_size.send_replace(client_size);
-        self.access_gate
-            .set_display_state(client_size, self.hub.size(), self.hub.is_available());
+        self.access_gate.set_display_capabilities(
+            client_size,
+            self.hub.size(),
+            self.hub.supported_sizes(),
+            self.hub.is_available(),
+        );
         self.forward_pending_access_action();
         tracing::info!(
             width = client_size.width,
@@ -382,12 +430,17 @@ impl RdpServerDisplay for RdpDisplay {
             height = client_size.height,
             "SunRDP display stream opened"
         );
-        self.access_gate
-            .set_display_state(client_size, self.hub.size(), self.hub.is_available());
+        self.access_gate.set_display_capabilities(
+            client_size,
+            self.hub.size(),
+            self.hub.supported_sizes(),
+            self.hub.is_available(),
+        );
         self.forward_pending_access_action();
         Ok(Box::new(RdpDisplayUpdates {
             receiver: self.hub.subscribe(),
             host_size: self.hub.subscribe_size(),
+            supported_sizes: self.hub.subscribe_supported_sizes(),
             host_available: self.hub.subscribe_available(),
             pointer_position: self.hub.subscribe_pointer_position(),
             access: self.access_gate.subscribe(),
@@ -408,6 +461,7 @@ impl RdpServerDisplay for RdpDisplay {
 struct RdpDisplayUpdates {
     receiver: watch::Receiver<Option<Arc<CapturedFrame>>>,
     host_size: watch::Receiver<DesktopSize>,
+    supported_sizes: watch::Receiver<Vec<DesktopSize>>,
     host_available: watch::Receiver<bool>,
     pointer_position: watch::Receiver<Option<Point16>>,
     access: watch::Receiver<crate::access::AccessSnapshot>,
@@ -490,6 +544,11 @@ impl RdpServerDisplayUpdates for RdpDisplayUpdates {
                     self.sync_display_state();
                     Ok(Some(self.current_update()?))
                 }
+                changed = self.supported_sizes.changed() => {
+                    changed.context("host display-mode stream closed")?;
+                    self.sync_display_state();
+                    Ok(Some(self.current_update()?))
+                }
                 changed = self.host_available.changed() => {
                     changed.context("host availability stream closed")?;
                     self.sync_display_state();
@@ -514,6 +573,11 @@ impl RdpServerDisplayUpdates for RdpDisplayUpdates {
                 }
                 changed = self.host_size.changed() => {
                     changed.context("host display-size stream closed")?;
+                    self.sync_display_state();
+                    Ok(Some(self.current_update()?))
+                }
+                changed = self.supported_sizes.changed() => {
+                    changed.context("host display-mode stream closed")?;
                     self.sync_display_state();
                     Ok(Some(self.current_update()?))
                 }
@@ -595,9 +659,14 @@ impl RdpDisplayUpdates {
 
     fn sync_display_state(&mut self) {
         let host_size = *self.host_size.borrow_and_update();
+        let supported_sizes = self.supported_sizes.borrow_and_update().clone();
         let available = *self.host_available.borrow_and_update();
-        self.access_gate
-            .set_display_state(self.client_size, host_size, available);
+        self.access_gate.set_display_capabilities(
+            self.client_size,
+            host_size,
+            supported_sizes,
+            available,
+        );
         if let Some(AccessAction::ChangeDisplaySize(target)) =
             self.access_gate.take_pending_action()
             && self
@@ -695,7 +764,16 @@ fn scale_frame(frame: &CapturedFrame, target: DesktopSize) -> Result<CapturedFra
         PixelType::U8x4,
     );
     let options = ResizeOptions::new()
-        .resize_alg(ResizeAlg::Interpolation(FilterType::Bilinear))
+        .resize_alg(desktop_resize_algorithm(
+            DesktopSize {
+                width: frame.width,
+                height: frame.height,
+            },
+            DesktopSize {
+                width: viewport.width,
+                height: viewport.height,
+            },
+        ))
         .use_alpha(false);
     Resizer::new()
         .resize(&source, &mut destination, &options)
@@ -716,6 +794,19 @@ fn scale_frame(frame: &CapturedFrame, target: DesktopSize) -> Result<CapturedFra
         height: target.height,
         rgba,
     })
+}
+
+fn desktop_resize_algorithm(source: DesktopSize, target: DesktopSize) -> ResizeAlg {
+    if target.width > source.width || target.height > source.height {
+        // Bilinear interpolation visibly softens ClearType and other one-pixel
+        // desktop details. Catmull-Rom retains edge contrast during upscaling
+        // without the stronger ringing that Lanczos can add around text.
+        ResizeAlg::Convolution(FilterType::CatmullRom)
+    } else {
+        // Downscaling benefits from the wider low-pass filter to avoid aliasing
+        // in dense UI details and thin glyph strokes.
+        ResizeAlg::Convolution(FilterType::Lanczos3)
+    }
 }
 
 fn to_bitmap_update(frame: &CapturedFrame) -> Result<BitmapUpdate> {
@@ -760,6 +851,7 @@ mod tests {
 
     use super::*;
     use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits};
+    use ironrdp_server::KeyboardEvent;
     use ironrdp_server::bench::encoder::{UpdateEncoder, UpdateEncoderCodecs};
 
     fn test_size() -> DesktopSize {
@@ -1057,6 +1149,36 @@ mod tests {
         assert_eq!(&scaled.rgba[48..64], &bar);
     }
 
+    #[test]
+    fn desktop_scaling_uses_sharp_filters_instead_of_bilinear_interpolation() {
+        assert_eq!(
+            desktop_resize_algorithm(
+                DesktopSize {
+                    width: 1920,
+                    height: 1200,
+                },
+                DesktopSize {
+                    width: 2560,
+                    height: 1600,
+                },
+            ),
+            ResizeAlg::Convolution(FilterType::CatmullRom)
+        );
+        assert_eq!(
+            desktop_resize_algorithm(
+                DesktopSize {
+                    width: 2560,
+                    height: 1600,
+                },
+                DesktopSize {
+                    width: 1920,
+                    height: 1200,
+                },
+            ),
+            ResizeAlg::Convolution(FilterType::Lanczos3)
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn desktop_stays_gated_and_reconnect_returns_to_access_screen() {
         let size = test_size();
@@ -1080,6 +1202,10 @@ mod tests {
         );
         let generation = gate.begin_validation("test-user");
         gate.finish_validation(generation, "test-user", Ok(true));
+        gate.handle_keyboard(&KeyboardEvent::Pressed {
+            code: 28,
+            extended: false,
+        });
         assert_eq!(read_screen(updates.as_mut(), size).await, pixels);
         drop(updates);
         gate.reset();

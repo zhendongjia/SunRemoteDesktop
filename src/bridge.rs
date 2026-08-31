@@ -5,9 +5,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::platform::{CapturedFrame, DesktopSize};
 
 const MAGIC: [u8; 4] = *b"RDPH";
-const PROTOCOL_VERSION: u16 = 2;
+const PROTOCOL_VERSION: u16 = 3;
 const MINIMUM_PROTOCOL_VERSION: u16 = 1;
-const HELLO_LENGTH: u16 = 16;
+const HELLO_BASE_LENGTH: u16 = 16;
+const MAX_DISPLAY_MODES: usize = 256;
 const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 
 const FRAME: u8 = 0x01;
@@ -31,10 +32,11 @@ const MOUSE_VERTICAL_SCROLL: u8 = 0x2c;
 const MOUSE_SCROLL: u8 = 0x2d;
 const SET_DISPLAY_SIZE: u8 = 0x30;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Handshake {
     version: u16,
     size: DesktopSize,
+    supported_sizes: Vec<DesktopSize>,
 }
 
 enum InputCommand {
@@ -43,18 +45,44 @@ enum InputCommand {
     SetDisplaySize(DesktopSize),
 }
 
-async fn write_handshake<W>(writer: &mut W, size: DesktopSize) -> Result<()>
+async fn write_handshake<W>(
+    writer: &mut W,
+    size: DesktopSize,
+    supported_sizes: &[DesktopSize],
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     validate_size(size)?;
-    let mut data = Vec::with_capacity(usize::from(HELLO_LENGTH));
+    let mut supported_sizes = supported_sizes.to_vec();
+    if !supported_sizes.contains(&size) {
+        supported_sizes.push(size);
+    }
+    supported_sizes.sort_unstable_by_key(|mode| (mode.width, mode.height));
+    supported_sizes.dedup();
+    anyhow::ensure!(
+        !supported_sizes.is_empty() && supported_sizes.len() <= MAX_DISPLAY_MODES,
+        "invalid number of display modes"
+    );
+    for mode in &supported_sizes {
+        validate_size(*mode)?;
+    }
+    let hello_length = usize::from(HELLO_BASE_LENGTH)
+        .checked_add(supported_sizes.len() * 4)
+        .context("agent handshake length overflow")?;
+    let hello_length = u16::try_from(hello_length).context("agent handshake is too large")?;
+    let mut data = Vec::with_capacity(usize::from(hello_length));
     data.extend_from_slice(&MAGIC);
     data.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-    data.extend_from_slice(&HELLO_LENGTH.to_le_bytes());
+    data.extend_from_slice(&hello_length.to_le_bytes());
     data.extend_from_slice(&size.width.to_le_bytes());
     data.extend_from_slice(&size.height.to_le_bytes());
-    data.extend_from_slice(&0u32.to_le_bytes());
+    data.extend_from_slice(&(supported_sizes.len() as u16).to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    for mode in supported_sizes {
+        data.extend_from_slice(&mode.width.to_le_bytes());
+        data.extend_from_slice(&mode.height.to_le_bytes());
+    }
     writer
         .write_all(&data)
         .await
@@ -65,28 +93,70 @@ async fn read_handshake<R>(reader: &mut R) -> Result<Handshake>
 where
     R: AsyncRead + Unpin,
 {
-    let mut data = [0u8; HELLO_LENGTH as usize];
+    let mut fixed = [0u8; 8];
     reader
-        .read_exact(&mut data)
+        .read_exact(&mut fixed)
         .await
         .context("read agent handshake")?;
-    anyhow::ensure!(data[0..4] == MAGIC, "invalid session bridge magic");
-    let version = u16::from_le_bytes([data[4], data[5]]);
+    anyhow::ensure!(fixed[0..4] == MAGIC, "invalid session bridge magic");
+    let version = u16::from_le_bytes([fixed[4], fixed[5]]);
     anyhow::ensure!(
         (MINIMUM_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version),
         "unsupported session bridge protocol version {version}"
     );
-    let header_length = u16::from_le_bytes([data[6], data[7]]);
+    let header_length = u16::from_le_bytes([fixed[6], fixed[7]]);
     anyhow::ensure!(
-        header_length == HELLO_LENGTH,
+        header_length >= HELLO_BASE_LENGTH
+            && usize::from(header_length) <= usize::from(HELLO_BASE_LENGTH) + MAX_DISPLAY_MODES * 4,
         "unsupported session bridge handshake length {header_length}"
     );
+    let mut data = vec![0_u8; usize::from(header_length)];
+    data[..fixed.len()].copy_from_slice(&fixed);
+    reader
+        .read_exact(&mut data[fixed.len()..])
+        .await
+        .context("read agent handshake payload")?;
     let size = DesktopSize {
         width: u16::from_le_bytes([data[8], data[9]]),
         height: u16::from_le_bytes([data[10], data[11]]),
     };
     validate_size(size)?;
-    Ok(Handshake { version, size })
+    let supported_sizes = if version >= 3 {
+        let count = usize::from(u16::from_le_bytes([data[12], data[13]]));
+        anyhow::ensure!(
+            count > 0
+                && count <= MAX_DISPLAY_MODES
+                && usize::from(header_length) == usize::from(HELLO_BASE_LENGTH) + count * 4,
+            "invalid display-mode list in the agent handshake"
+        );
+        let mut modes = Vec::with_capacity(count);
+        for chunk in data[usize::from(HELLO_BASE_LENGTH)..].as_chunks::<4>().0 {
+            let mode = DesktopSize {
+                width: u16::from_le_bytes([chunk[0], chunk[1]]),
+                height: u16::from_le_bytes([chunk[2], chunk[3]]),
+            };
+            validate_size(mode)?;
+            if !modes.contains(&mode) {
+                modes.push(mode);
+            }
+        }
+        anyhow::ensure!(
+            modes.contains(&size),
+            "agent display-mode list omits the current mode"
+        );
+        modes
+    } else {
+        anyhow::ensure!(
+            header_length == HELLO_BASE_LENGTH,
+            "legacy session bridge handshake has an invalid length"
+        );
+        vec![size]
+    };
+    Ok(Handshake {
+        version,
+        size,
+        supported_sizes,
+    })
 }
 
 async fn write_frame<W>(writer: &mut W, frame: &CapturedFrame) -> Result<()>
@@ -352,10 +422,20 @@ mod tests {
             height: 1080,
         };
         let (mut writer, mut reader) = tokio::io::duplex(64);
-        write_handshake(&mut writer, size).await.unwrap();
+        let supported = [
+            DesktopSize {
+                width: 1280,
+                height: 720,
+            },
+            size,
+        ];
+        write_handshake(&mut writer, size, &supported)
+            .await
+            .unwrap();
         let handshake = read_handshake(&mut reader).await.unwrap();
         assert_eq!(handshake.version, PROTOCOL_VERSION);
         assert_eq!(handshake.size, size);
+        assert_eq!(handshake.supported_sizes.len(), 2);
     }
 
     #[tokio::test]
@@ -364,13 +444,14 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&MAGIC);
         data.extend_from_slice(&MINIMUM_PROTOCOL_VERSION.to_le_bytes());
-        data.extend_from_slice(&HELLO_LENGTH.to_le_bytes());
+        data.extend_from_slice(&HELLO_BASE_LENGTH.to_le_bytes());
         data.extend_from_slice(&640u16.to_le_bytes());
         data.extend_from_slice(&480u16.to_le_bytes());
         data.extend_from_slice(&0u32.to_le_bytes());
         writer.write_all(&data).await.unwrap();
         let handshake = read_handshake(&mut reader).await.unwrap();
         assert_eq!(handshake.version, MINIMUM_PROTOCOL_VERSION);
+        assert_eq!(handshake.supported_sizes, vec![handshake.size]);
     }
 
     #[tokio::test]
@@ -379,7 +460,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&MAGIC);
         data.extend_from_slice(&(PROTOCOL_VERSION + 1).to_le_bytes());
-        data.extend_from_slice(&HELLO_LENGTH.to_le_bytes());
+        data.extend_from_slice(&HELLO_BASE_LENGTH.to_le_bytes());
         data.extend_from_slice(&640u16.to_le_bytes());
         data.extend_from_slice(&480u16.to_le_bytes());
         data.extend_from_slice(&0u32.to_le_bytes());

@@ -250,8 +250,10 @@ async fn serve_agents(
             protocol_version = handshake.version,
             width = handshake.size.width,
             height = handshake.size.height,
+            display_modes = handshake.supported_sizes.len(),
             "Windows session agent connected"
         );
+        hub.set_display_capabilities(handshake.size, handshake.supported_sizes.clone());
         if let Err(error) = serve_agent(
             &mut pipe,
             &hub,
@@ -378,8 +380,20 @@ pub async fn run_agent(config_path: &Path) -> Result<()> {
     loop {
         match ClientOptions::new().open(&pipe_name) {
             Ok(mut pipe) => {
-                let current_size = hub.size();
-                if let Err(error) = write_handshake(&mut pipe, current_size).await {
+                let captured_size = hub.size();
+                let (current_size, supported_sizes) =
+                    match crate::platform::windows::primary_display_capabilities() {
+                        Ok(capabilities) => capabilities,
+                        Err(error) => {
+                            tracing::warn!(
+                                ?error,
+                                "unable to enumerate physical display modes; advertising only the current mode"
+                            );
+                            (captured_size, vec![captured_size])
+                        }
+                    };
+                if let Err(error) = write_handshake(&mut pipe, current_size, &supported_sizes).await
+                {
                     tracing::warn!(?error, "unable to initialize the service bridge");
                 } else {
                     tracing::info!("session agent connected to the system service");
@@ -917,7 +931,7 @@ mod tests {
             width: 4,
             height: 2,
         };
-        write_handshake(&mut client, size).await.unwrap();
+        write_handshake(&mut client, size, &[size]).await.unwrap();
         let backend = service.await.unwrap().unwrap();
         assert!(!backend.hub.is_available());
         let mut frames = backend.hub.subscribe();
@@ -993,7 +1007,7 @@ mod tests {
                 Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
             }
         };
-        write_handshake(&mut reconnected_client, resized)
+        write_handshake(&mut reconnected_client, resized, &[resized])
             .await
             .unwrap();
         let (_reader, mut writer) = split(reconnected_client);

@@ -369,10 +369,10 @@ async fn run_authenticated_wire_probe(
         started.elapsed().as_millis()
     );
 
-    // A deliberately mismatched client canvas reaches the authenticated
-    // resolution-choice page. Enter confirms its default scaling policy. A
-    // complete follow-up surface proves the server kept the same connection
-    // alive while opening the captured physical desktop.
+    // Authentication always reaches the host-mode picker. Enter confirms its
+    // default (the physical screen's current mode). A complete follow-up
+    // surface proves the server kept the same connection alive while opening
+    // the captured physical desktop.
     let mut confirmation_events = Vec::new();
     if takeover {
         confirmation_events.extend([

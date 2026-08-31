@@ -301,17 +301,13 @@ fn set_primary_display_size(size: DesktopSize) -> Result<()> {
     if !supported.contains(&current) {
         supported.push(current);
     }
-    let selected =
-        closest_display_size(size, &supported).context("no usable primary-display modes")?;
-    if selected != size {
-        tracing::info!(
-            requested_width = size.width,
-            requested_height = size.height,
-            selected_width = selected.width,
-            selected_height = selected.height,
-            "using the closest supported physical-display mode for the client window"
-        );
-    }
+    anyhow::ensure!(
+        supported.contains(&size),
+        "the primary display does not advertise the requested {}x{} mode",
+        size.width,
+        size.height
+    );
+    let selected = size;
     if selected == current {
         return Ok(());
     }
@@ -365,39 +361,32 @@ fn supported_primary_display_sizes() -> Result<Vec<DesktopSize>> {
     Ok(sizes)
 }
 
-fn closest_display_size(requested: DesktopSize, supported: &[DesktopSize]) -> Option<DesktopSize> {
-    let requested_pixels = display_pixel_count(requested);
-    let compare = |left: &DesktopSize, right: &DesktopSize| {
-        display_mode_score(requested, *left).total_cmp(&display_mode_score(requested, *right))
+pub(crate) fn primary_display_capabilities() -> Result<(DesktopSize, Vec<DesktopSize>)> {
+    let mut mode = DEVMODEW {
+        dmSize: u16::try_from(size_of::<DEVMODEW>()).context("DEVMODEW is too large")?,
+        ..Default::default()
     };
-    supported
-        .iter()
-        .copied()
-        .filter(|candidate| display_pixel_count(*candidate) <= requested_pixels)
-        .min_by(compare)
-        .or_else(|| {
-            // Very small client windows can be below the minimum physical
-            // mode. In that case there is no alternative to choosing the
-            // closest supported mode and scaling it down.
-            supported.iter().copied().min_by(compare)
-        })
-}
-
-fn display_pixel_count(size: DesktopSize) -> u64 {
-    u64::from(size.width) * u64::from(size.height)
-}
-
-fn display_mode_score(requested: DesktopSize, candidate: DesktopSize) -> f64 {
-    let requested_width = f64::from(requested.width.max(1));
-    let requested_height = f64::from(requested.height.max(1));
-    let candidate_width = f64::from(candidate.width.max(1));
-    let candidate_height = f64::from(candidate.height.max(1));
-    let aspect_error =
-        ((candidate_width / candidate_height) - (requested_width / requested_height)).abs()
-            / (requested_width / requested_height);
-    let size_error = (candidate_width - requested_width).abs() / requested_width
-        + (candidate_height - requested_height).abs() / requested_height;
-    aspect_error * 8.0 + size_error
+    anyhow::ensure!(
+        unsafe { EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut mode) }.as_bool(),
+        "read the current primary display mode"
+    );
+    let current = DesktopSize {
+        width: u16::try_from(mode.dmPelsWidth).context("current display width is too large")?,
+        height: u16::try_from(mode.dmPelsHeight).context("current display height is too large")?,
+    };
+    let mut supported = supported_primary_display_sizes()?;
+    if !supported.contains(&current) {
+        supported.push(current);
+    }
+    supported.sort_unstable_by_key(|size| {
+        (
+            u32::from(size.width) * u32::from(size.height),
+            size.width,
+            size.height,
+        )
+    });
+    supported.dedup();
+    Ok((current, supported))
 }
 
 fn wheel_data(value: i32) -> u32 {
@@ -461,101 +450,5 @@ mod tests {
     fn frame_size_rejects_empty_capture() {
         assert!(frame_size(0, 1080).is_err());
         assert!(frame_size(1920, 0).is_err());
-    }
-
-    #[test]
-    fn display_mode_selection_does_not_make_a_client_desktop_denser() {
-        let modes = [
-            DesktopSize {
-                width: 1920,
-                height: 1080,
-            },
-            DesktopSize {
-                width: 1680,
-                height: 1050,
-            },
-            DesktopSize {
-                width: 1280,
-                height: 1024,
-            },
-        ];
-        assert_eq!(
-            closest_display_size(
-                DesktopSize {
-                    width: 1500,
-                    height: 940,
-                },
-                &modes
-            ),
-            Some(DesktopSize {
-                width: 1280,
-                height: 1024,
-            })
-        );
-    }
-
-    #[test]
-    fn macos_windows_app_uses_a_smaller_physical_mode() {
-        let modes = [
-            DesktopSize {
-                width: 800,
-                height: 600,
-            },
-            DesktopSize {
-                width: 1366,
-                height: 768,
-            },
-            DesktopSize {
-                width: 1920,
-                height: 1080,
-            },
-            DesktopSize {
-                width: 1920,
-                height: 1200,
-            },
-        ];
-        assert_eq!(
-            closest_display_size(
-                DesktopSize {
-                    width: 1440,
-                    height: 900,
-                },
-                &modes
-            ),
-            Some(DesktopSize {
-                width: 1366,
-                height: 768,
-            })
-        );
-    }
-
-    #[test]
-    fn display_mode_selection_falls_back_when_every_mode_is_larger() {
-        let mode = DesktopSize {
-            width: 800,
-            height: 600,
-        };
-        assert_eq!(
-            closest_display_size(
-                DesktopSize {
-                    width: 640,
-                    height: 480,
-                },
-                &[mode]
-            ),
-            Some(mode)
-        );
-    }
-
-    #[test]
-    fn display_mode_selection_keeps_an_exact_mode() {
-        let requested = DesktopSize {
-            width: 1920,
-            height: 1200,
-        };
-        assert_eq!(
-            closest_display_size(requested, &[requested]),
-            Some(requested)
-        );
     }
 }
