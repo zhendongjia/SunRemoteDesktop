@@ -119,10 +119,16 @@ struct NegotiationRequest {
 
 impl NegotiationRequest {
     fn preferred_nla_protocol(self) -> Option<u32> {
-        if self.requested_protocols & PROTOCOL_HYBRID_EX != 0 {
-            Some(PROTOCOL_HYBRID_EX)
-        } else if self.requested_protocols & PROTOCOL_HYBRID != 0 {
+        // mstsc and Windows App normally advertise both HYBRID and
+        // HYBRID_EX. Prefer the standard CredSSP path so the client proceeds
+        // directly to MCS after credentials are accepted. HYBRID_EX adds an
+        // Early User Authorization Result PDU that is unnecessary here and
+        // has produced post-authentication 0x609 disconnects in Microsoft
+        // clients. Keep it as a fallback for peers that offer only HYBRID_EX.
+        if self.requested_protocols & PROTOCOL_HYBRID != 0 {
             Some(PROTOCOL_HYBRID)
+        } else if self.requested_protocols & PROTOCOL_HYBRID_EX != 0 {
+            Some(PROTOCOL_HYBRID_EX)
         } else {
             None
         }
@@ -863,14 +869,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_cookie_and_prefers_hybrid_ex() {
+    fn parses_cookie_and_prefers_standard_hybrid() {
         let request = request_with_cookie(PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX);
+        let negotiation = parse_negotiation_request(&request).unwrap();
+        assert_eq!(negotiation.preferred_nla_protocol(), Some(PROTOCOL_HYBRID));
+        assert_eq!(negotiation.requested_protocols, 0x0b);
+    }
+
+    #[test]
+    fn supports_hybrid_ex_when_it_is_the_only_nla_protocol() {
+        let request = request_with_cookie(PROTOCOL_SSL | PROTOCOL_HYBRID_EX);
         let negotiation = parse_negotiation_request(&request).unwrap();
         assert_eq!(
             negotiation.preferred_nla_protocol(),
             Some(PROTOCOL_HYBRID_EX)
         );
-        assert_eq!(negotiation.requested_protocols, 0x0b);
     }
 
     #[test]
